@@ -135,10 +135,11 @@ class GazeboEnv:
         self.observation_space = (3, 64, 64)
         self.state = np.zeros(self.observation_space)
         self.done = False
-        self.target_x = -5.3334
-        self.target_y = -0.3768
-        self.waypoints = self.generate_waypoints()
-        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器任要奏的大致距離
+        self.target_x = -7.2213
+        self.target_y = -1.7003  
+        # self.initialize_path_planning()
+        # self.waypoints = self.generate_random_waypoints()
+        # self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器任要奏的大致距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
@@ -149,193 +150,271 @@ class GazeboEnv:
         self.max_no_progress_steps = 10
         self.no_progress_steps = 0
         
-        # 新增屬性，標記是否已計算過優化路徑
-        self.optimized_waypoints_calculated = False
-        self.optimized_waypoints = []  # 儲存優化後的路徑點
+        self.optimized_segments = []
+        self.base_path = None
+        self.path_segments = []
 
-        self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
+        # map相關
+        # self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
+        self.robot_radius = 0.1
+        self.safety_margin = 0.2
 
-        # 加载SLAM地圖
-        self.load_slam_map('/home/ash/Downloads/0822-1floor/my_map0924.yaml')
+        # self.initialize_path_planning()
+    
+    def generate_costmap(self):
+        """生成基于颜色的代价地图"""
+        if self.slam_map is None:
+            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
+            return False
 
-        self.optimize_waypoints_with_a_star()
-        
+        # 假设墙壁颜色是白色（你可以根据实际地图修改这个颜色）
+        wall_color = np.array([100, 100, 100])  # 例如，墙壁是白色的
+        wall_color2 = np.array([120, 120, 120])  # 例如，墙壁是白色的
+
+        # 将地图转换为 RGB 色彩模式（如果它是灰度图）
+        img = cv2.cvtColor(self.slam_map, cv2.COLOR_GRAY2BGR) 
+
+        # 创建掩码：找出指定颜色的墙壁（使用 cv2.inRange 对墙壁颜色进行提取）
+        wall_mask = cv2.inRange(img, wall_color, wall_color2)
+
+        # 初始化代价地图
+        self.cost_map = np.zeros_like(self.slam_map)
+
+        # 设定膨胀的内外层大小
+        inner_dilation = 7  # 内层膨胀的大小
+        outer_dilation = 15  # 外层膨胀的大小
+
+        # 内层膨胀 (膨胀操作将墙壁区域扩展)
+        inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
+        inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
+
+        # 外层膨胀
+        outer_kernel = np.ones((outer_dilation * 2 + 1, outer_dilation * 2 + 1), np.uint8)
+        outer_dilated = cv2.dilate(wall_mask, outer_kernel, iterations=1)
+
+        # 计算外层区域（去掉内层部分）
+        outer_only = cv2.subtract(outer_dilated, inner_dilated)
+
+        # 内层区域设置为高代价
+        self.cost_map[inner_dilated > 0] = 255  # 高代价区域
+
+        # 外层区域设置为低代价
+        self.cost_map[outer_only > 0] = 100  # 低代价区域
+
+        # 墙壁区域为障碍物
+        self.cost_map[wall_mask > 0] = 50  # 障碍物
+
+        rospy.loginfo("Costmap generated successfully.")
+        return True
+
+    
     def load_slam_map(self, yaml_path):
-        # 讀取 YAML 檔案
+        """读取并加载SLAM地图"""
+        # 读取YAML文件
         with open(yaml_path, 'r') as file:
             map_metadata = yaml.safe_load(file)
-            self.map_origin = map_metadata['origin']  # 地圖原點
-            self.map_resolution = map_metadata['resolution']  # 地圖解析度
-            png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
             
-            # 使用 PIL 讀取PNG檔
-            png_image = Image.open(png_path).convert('L')
-            self.slam_map = np.array(png_image)  # 轉為NumPy陣列
+        self.map_origin = map_metadata['origin']  # 地图原点
+        self.map_resolution = map_metadata['resolution']  # 地图解析度
+        png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改为png文件路径
+        
+        # 使用PIL读取PNG文件
+        png_image = Image.open(png_path).convert('L')
+        self.slam_map = np.array(png_image)  # 转为NumPy数组
 
-
-    def generate_waypoints(self):
-        waypoints = [
-            (0.2206, 0.1208),
-            (1.2812, 0.0748),
-            (2.3472, 0.129),
-            (3.4053, 0.1631),
-            (4.4468, 0.1421),
-            (5.5032, 0.1996),
-            (6.5372, 0.2315),
-            (7.5948, 0.2499),
-            (8.6607, 0.3331),
-            (9.6811, 0.3973),
-            (10.6847, 0.4349),
-            (11.719, 0.4814),
-            (12.7995, 0.5223),
-            (13.8983, 0.515),
-            (14.9534, 0.6193),
-            (15.9899, 0.7217),
-            (17.0138, 0.7653),
-            (18.0751, 0.8058),
-            (19.0799, 0.864),
-            (20.1383, 0.936),
-            (21.1929, 0.9923),
-            (22.2351, 1.0279),
-            (23.3374, 1.1122),
-            (24.4096, 1.1694),
-            (25.4817, 1.2437),
-            (26.5643, 1.3221),
-            (27.6337, 1.4294),
-            (28.6643, 1.4471),
-            (29.6839, 1.4987),
-            (30.7, 1.58),
-            (31.7796, 1.6339),
-            (32.8068, 1.7283),
-            (33.8596, 1.8004),
-            (34.9469, 1.9665),
-            (35.9883, 1.9812),
-            (37.0816, 2.0237),
-            (38.1077, 2.1291),
-            (39.1405, 2.1418),
-            (40.1536, 2.2273),
-            (41.1599, 2.2473),
-            (42.2476, 2.2927),
-            (43.3042, 2.341),
-            (44.4049, 2.39),
-            (45.5091, 2.4284),
-            (46.579, 2.5288),
-            (47.651, 2.4926),
-            (48.6688, 2.6072),
-            (49.7786, 2.6338),
-            (50.7942, 2.6644),
-            (51.868, 2.7625),
-            (52.9149, 2.8676),
-            (54.0346, 2.9602),
-            (55.0855, 2.9847),
-            (56.1474, 3.1212),
-            (57.2397, 3.2988),
-            (58.2972, 3.5508),
-            (59.1103, 4.1404),
-            (59.6059, 5.1039),
-            (59.6032, 6.2015),
-            (59.4278, 7.212),
-            (59.3781, 8.2782),
-            (59.4323, 9.2866),
-            (59.3985, 10.304),
-            (59.3676, 11.3302),
-            (59.3193, 12.3833),
-            (59.359, 13.4472),
-            (59.3432, 14.4652),
-            (59.3123, 15.479),
-            (59.1214, 16.4917),
-            (58.7223, 17.4568),
-            (57.8609, 18.1061),
-            (56.8366, 18.3103),
-            (55.7809, 18.0938),
-            (54.7916, 17.707),
-            (53.7144, 17.5087),
-            (52.6274, 17.3683),
-            (51.6087, 17.1364),
-            (50.5924, 17.0295),
-            (49.5263, 16.9058),
-            (48.4514, 16.7769),
-            (47.3883, 16.6701),
-            (46.3186, 16.5403),
-            (45.3093, 16.4615),
-            (44.263, 16.299),
-            (43.2137, 16.1486),
-            (42.171, 16.0501),
-            (41.1264, 16.0245),
-            (40.171, 16.7172),
-            (39.1264, 16.8428),
-            (38.1122, 17.019),
-            (37.2234, 16.5322),
-            (36.6845, 15.6798),
-            (36.3607, 14.7064),
-            (35.5578, 13.9947),
-            (34.5764, 13.7466),
-            (33.5137, 13.6068),
-            (32.4975, 13.5031),
-            (31.5029, 13.3368),
-            (30.4162, 13.1925),
-            (29.3894, 13.067),
-            (28.3181, 12.9541),
-            (27.3195, 12.8721),
-            (26.2852, 12.8035),
-            (25.241, 12.6952),
-            (24.1598, 12.6435),
-            (23.0712, 12.5947),
-            (21.9718, 12.5297),
-            (20.9141, 12.4492),
-            (19.8964, 12.3878),
-            (18.7163, 12.32),
-            (17.6221, 12.2928),
-            (16.5457, 12.2855),
-            (15.5503, 12.1534),
-            (14.4794, 12.0462),
-            (13.4643, 11.9637),
-            (12.3466, 11.7943),
-            (11.2276, 11.6071),
-            (10.2529, 12.0711),
-            (9.7942, 13.0066),
-            (9.398, 13.9699),
-            (8.6017, 14.7268),
-            (7.4856, 14.8902),
-            (6.5116, 14.4724),
-            (5.4626, 14.1256),
-            (4.3911, 13.9535),
-            (3.3139, 13.8013),
-            (2.2967, 13.7577),
-            (1.2165, 13.7116),
-            (0.1864, 13.6054),
-            (-0.9592, 13.4747),
-            (-2.0086, 13.352),
-            (-3.0267, 13.3358),
-            (-4.0117, 13.5304),
-            (-5.0541, 13.8047),
-            (-6.0953, 13.9034),
-            (-7.1116, 13.8871),
-            (-8.152, 13.8062),
-            (-9.195, 13.7043),
-            (-10.2548, 13.6152),
-            (-11.234, 13.3289),
-            (-11.9937, 12.6211),
-            (-12.3488, 11.6585),
-            (-12.4231, 10.6268),
-            (-12.3353, 9.5915),
-            (-12.2405, 8.5597),
-            (-12.1454, 7.4974),
-            (-12.0596, 6.4487),
-            (-12.0537, 5.3613),
-            (-12.0269, 4.2741),
-            (-11.999, 3.2125),
-            (-11.9454, 2.2009),
-            (-11.7614, 1.1884),
-            (-11.2675, 0.2385),
-            (-10.5404, -0.58),
-            (-9.4494, -0.8399),
-            (-8.3965, -0.8367),
-            (-7.3912, -0.6242),
-            (-6.3592, -0.463),
+    def generate_random_waypoints(self):
+        # 預定義的 waypoints
+        all_waypoints = [
+            (-6.4981, -1.0627),
+            (-5.4541, -1.0117),
+            (-4.4041, -0.862),
+            (-3.3692, -1.0294),
+            (-2.295, -1.114),
+            (-1.2472, -1.0318),
+            (-0.1614, -0.6948),
+            (0.8931, -0.8804),
+            (1.9412, -0.8604),
+            (2.9804, -0.7229),
+            (3.874, -0.2681),
+            (4.9283, -0.1644),
+            (5.9876, -0.345),
+            (7.019, -0.5218),
+            (7.9967, -0.2338),
+            (9.0833, -0.1096),
+            (10.1187, -0.3335),
+            (11.1745, -0.6322),
+            (12.1693, -0.8619),
+            (13.1291, -0.4148),
+            (14.1217, -0.0282),
+            (15.1261, 0.123),
+            (16.1313, 0.4439),
+            (17.1389, 0.696),
+            (18.1388, 0.6685),
+            (19.2632, 0.5127),
+            (20.2774, 0.2655),
+            (21.2968, 0.0303),
+            (22.3133, -0.0192),
+            (23.2468, 0.446),
+            (24.1412, 0.9065),
+            (25.1178, 0.5027),
+            (26.1279, 0.4794),
+            (27.0867, 0.8266),
+            (28.0713, 1.4229),
+            (29.1537, 1.3866),
+            (30.2492, 1.1549),
+            (31.385, 1.0995),
+            (32.4137, 1.243),
+            (33.4134, 1.5432),
+            (34.4137, 1.5904),
+            (35.4936, 1.5904),
+            (36.5067, 1.5607),
+            (37.5432, 1.5505),
+            (38.584, 1.7008),
+            (39.6134, 1.9053),
+            (40.5979, 2.0912),
+            (41.6557, 2.3779),
+            (42.5711, 2.8643),
+            (43.5911, 2.9725),
+            (44.5929, 3.0637),
+            (45.5919, 2.9841),
+            (46.6219, 2.9569),
+            (47.6314, 3.0027),
+            (48.7359, 2.832),
+            (49.5462, 2.1761),
+            (50.5982, 2.1709),
+            (51.616, 2.3573),
+            (52.6663, 2.5593),
+            (53.7532, 2.5325),
+            (54.7851, 2.5474),
+            (55.8182, 2.5174),
+            (56.8358, 2.6713),
+            (57.8557, 2.8815),
+            (58.8912, 3.0949),
+            (59.7436, 3.6285),
+            (60.5865, 4.2367),
+            (60.6504, 5.2876),
+            (60.7991, 6.3874),
+            (60.322, 7.3094),
+            (59.8004, 8.1976),
+            (59.4093, 9.195),
+            (59.1417, 10.1994),
+            (59.1449, 11.2274),
+            (59.5323, 12.2182),
+            (59.8637, 13.2405),
+            (60.5688, 14.0568),
+            (60.6266, 15.1571),
+            (60.007, 15.9558),
+            (59.0539, 16.5128),
+            (57.9671, 16.526),
+            (56.9161, 16.7399),
+            (55.9553, 17.0346),
+            (54.9404, 17.0596),
+            (53.9559, 16.8278),
+            (52.9408, 16.8697),
+            (51.9147, 16.7642),
+            (50.9449, 16.4902),
+            (49.9175, 16.3029),
+            (48.8903, 16.1165),
+            (47.7762, 16.0994),
+            (46.7442, 16.0733),
+            (45.7566, 15.8195),
+            (44.756, 15.7218),
+            (43.7254, 15.9309),
+            (42.6292, 15.8439),
+            (41.6163, 15.8177),
+            (40.5832, 15.7881),
+            (39.5617, 15.773),
+            (38.5099, 15.5648),
+            (37.692, 14.9481),
+            (36.8538, 14.3078),
+            (35.8906, 13.8384),
+            (34.8551, 13.6316),
+            (33.8205, 13.5495),
+            (32.7391, 13.4423),
+            (31.7035, 13.1056),
+            (30.6971, 12.7802),
+            (29.6914, 12.5216),
+            (28.7072, 12.3238),
+            (27.6442, 12.0953),
+            (26.5991, 11.9873),
+            (25.5713, 11.9867),
+            (24.488, 12.0679),
+            (23.4441, 12.0246),
+            (22.3169, 11.7745),
+            (21.3221, 11.538),
+            (20.3265, 11.4243),
+            (19.2855, 11.5028),
+            (18.2164, 11.5491),
+            (17.1238, 11.6235),
+            (16.0574, 11.4029),
+            (14.982, 11.2479),
+            (13.9491, 11.0487),
+            (12.9017, 11.1455),
+            (11.8915, 11.4186),
+            (10.8461, 11.6079),
+            (9.9029, 12.0097),
+            (9.0549, 12.5765),
+            (8.4289, 13.4238),
+            (7.4035, 13.6627),
+            (6.3785, 13.5659),
+            (5.3735, 13.4815),
+            (4.3971, 13.1044),
+            (3.3853, 13.2918),
+            (2.3331, 13.0208),
+            (1.2304, 12.9829),
+            (0.2242, 13.094),
+            (-0.807, 12.9358),
+            (-1.8081, 12.8495),
+            (-2.7738, 13.3168),
+            (-3.4822, 14.0699),
+            (-4.5285, 14.2483),
+            (-5.5965, 13.9753),
+            (-6.5324, 13.6016),
+            (-7.3092, 12.8632),
+            (-8.3255, 12.9916),
+            (-9.1914, 13.7593),
+            (-10.2374, 14.069),
+            (-11.2162, 13.7566),
+            (-11.653, 12.8061),
+            (-11.6989, 11.7238),
+            (-11.8899, 10.7353),
+            (-12.6174, 10.0373),
+            (-12.7701, 8.9551),
+            (-12.4859, 7.9523),
+            (-12.153, 6.8903),
+            (-12.4712, 5.819),
+            (-13.0498, 4.8729),
+            (-13.1676, 3.8605),
+            (-12.4328, 3.1822),
+            (-12.1159, 2.1018),
+            (-12.8436, 1.2659),
+            (-13.3701, 0.2175),
+            (-13.0514, -0.8866),
+            (-12.3046, -1.619),
+            (-11.2799, -1.472),
+            (-10.1229, -1.3051),
+            (-9.1283, -1.4767),
+            (-8.1332, -1.2563),
             (self.target_x, self.target_y)
         ]
-        return waypoints
+        
+        # 設定要採樣的點數（可以調整）
+        num_samples = 12
+        
+        # 確保包含起點和終點
+        sampled_waypoints = [all_waypoints[0]]  # 起點
+        
+        # 隨機採樣中間點
+        indices = np.linspace(1, len(all_waypoints)-2, num_samples-2, dtype=int)
+        indices = indices + np.random.randint(-3, 4, size=len(indices))  # 添加隨機偏移
+        indices = np.clip(indices, 1, len(all_waypoints)-2)  # 確保索引在有效範圍內
+        
+        for idx in indices:
+            sampled_waypoints.append(all_waypoints[idx])
+        
+        sampled_waypoints.append(all_waypoints[-1])  # 終點
+        
+        return sampled_waypoints
     
     def calculate_waypoint_distances(self):
         """
@@ -349,7 +428,6 @@ class GazeboEnv:
             distances.append(distance)
         return distances
 
-
     def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
         img_x = 2000 + gazebo_x * 20
         img_y = 2000 - gazebo_y * 20
@@ -359,67 +437,6 @@ class GazeboEnv:
         gazebo_x = (img_x - 2000) / 20
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
-
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
-        """
-        A* 算法對 50x50 的正方形內進行路徑優化
-        """
-        # 使用 self.gazebo_to_image_coords 而不是 gazebo_to_image_coords
-        img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
-
-        img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
-
-        best_f_score = float('inf')
-        best_point = (img_start_x, img_start_y)
-
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
-            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
-                if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
-                    continue
-
-                g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
-                h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
-
-                unwalkable_count = np.sum(png_image[max(0, y - grid_size // 2):min(y + grid_size // 2, png_image.shape[0]),
-                                                    max(0, x - grid_size // 2):min(x + grid_size // 2, png_image.shape[1])] < 250)
-
-                f = g + h + unwalkable_count * 2
-
-                if f < best_f_score:
-                    best_f_score = f
-                    best_point = (x, y)
-
-        # 使用 self.image_to_gazebo_coords 而不是 image_to_gazebo_coords
-        optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
-
-        return optimized_gazebo_x, optimized_gazebo_y
-
-
-    def optimize_waypoints_with_a_star(self):
-        """
-        使用 A* 算法来优化路径点，并确保包含用户设置的目标点
-        """
-        if self.optimized_waypoints_calculated:
-            rospy.loginfo("Using previously calculated optimized waypoints.")
-            self.waypoints = self.optimized_waypoints
-            return
-
-        rospy.loginfo("Calculating optimized waypoints using A*.")
-        optimized_waypoints = []
-
-        # 确保用户设置的目标点被包含
-        for i in range(len(self.waypoints) - 1):
-            start_point = self.waypoints[i]
-            goal_point = self.waypoints[i + 1] if i < len(self.waypoints) - 2 else (self.target_x, self.target_y)
-            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
-            optimized_waypoints.append(optimized_point)
-
-        optimized_waypoints.append((self.target_x, self.target_y))
-        self.optimized_waypoints = optimized_waypoints
-        self.waypoints = optimized_waypoints
-        self.optimized_waypoints_calculated = True
-
-
 
     def bezier_curve(self, waypoints, n_points=100):
         waypoints = np.array(waypoints)
@@ -622,7 +639,6 @@ class GazeboEnv:
 
         return self.state, reward, self.done, {}
 
-
     def reset(self):
 
         robot_x, robot_y,_ = self.get_robot_position()
@@ -685,7 +701,6 @@ class GazeboEnv:
 
         return self.state
 
-
     def calculate_reward(self, robot_x, robot_y, reward, state):
         done = False
         # 將機器人的座標轉換為地圖上的坐標
@@ -694,7 +709,7 @@ class GazeboEnv:
             state = state.cpu().numpy()
 
         if state.ndim == 4:
-            # 对于 4 维情况，取第一个批次数据中的第一层
+            # 对于 4 维情况，一个批次数据中的第一层
             occupancy_grid = state[0, 0]
         elif state.ndim == 3:
             # 对于 3 维情况，直接取第一层
@@ -754,7 +769,7 @@ class GazeboEnv:
                 min_distance = dist_to_wp
                 closest_index = i
 
-        # 如果沒有找到符合條件的點，則繼續使用原始最近點
+        # 如果有找到符合條件的點，則繼續使用原始最近點
         if closest_index is None:
             closest_index = self.find_closest_waypoint(robot_x, robot_y)
 
@@ -796,7 +811,6 @@ class GazeboEnv:
 
         return np.array([linear_speed, steer_angle])
 
-
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
         min_distance = float('inf')
@@ -820,6 +834,320 @@ class GazeboEnv:
             kd = 0.4
         return kp, kd
 
+    def reconstruct_path(self, came_from, current):
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
+        path.reverse()  # 因为路径是从终点回溯到起点，所以需要反转
+        print("PATH=",path)
+        return path
+    def calculate_movement_cost(self, current, neighbor):
+        """计算移动成本"""
+        # 将 Gazebo 坐标转换为图像坐标
+        current_img = self.gazebo_to_image_coords(*current)
+        neighbor_img = self.gazebo_to_image_coords(*neighbor)
+        
+        # 获取当前点和邻居点之间的区域
+        x_min, x_max = min(current_img[0], neighbor_img[0]), max(current_img[0], neighbor_img[0])
+        y_min, y_max = min(current_img[1], neighbor_img[1]), max(current_img[1], neighbor_img[1])
+        
+        # 确保索引在有效范围内
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(self.cost_map.shape[0] - 1, x_max)
+        y_max = min(self.cost_map.shape[1] - 1, y_max)
+        
+        # 获取区域
+        region = self.cost_map[x_min:x_max+1, y_min:y_max+1]
+        
+        # 基础移动成本
+        base_cost = np.sqrt((current[0] - neighbor[0])**2 + (current[1] - neighbor[1])**2)
+        
+        # 根据代价地图调整成本
+        if region.size > 0:  # 确保区域不为空
+            max_cost = np.max(region)
+            if max_cost >= 255:  # 如果路径穿过障碍物
+                return float('inf')
+            elif max_cost >= 100:  # 如果路径穿过高代价区域
+                return base_cost * 2.0
+            elif max_cost >= 50:   # 如果路径穿过低代价区域
+                return base_cost * 1.5
+        
+        return base_cost
+
+    def full_a_star_planning(self, start_point, goal_point):
+        """
+        完整的 A* 路徑規劃，使用改進的代價計算
+        """
+        # 轉換為圖像坐標
+        start = self.gazebo_to_image_coords(*start_point)
+        goal = self.gazebo_to_image_coords(*goal_point)
+        
+        open_set = {start}
+        closed_set = set()
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
+        
+        while open_set:
+            current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
+            
+            if self.is_near_goal(current, goal):
+                return self.reconstruct_path(came_from, current)
+            
+            open_set.remove(current)
+            closed_set.add(current)
+            
+            # 檢查8個方向
+            for dx, dy in [(0,1), (1,0), (0,-1), (-1,0), (1,1), (-1,1), (1,-1), (-1,-1)]:
+                neighbor = (current[0] + dx, current[1] + dy)
+                
+                if neighbor in closed_set:
+                    continue
+                
+                if not self.is_valid_point(neighbor):
+                    continue
+                
+                # 使用新的代價計算方法
+                movement_cost = self.calculate_movement_cost(current, neighbor)
+                if movement_cost == float('inf'):
+                    continue
+                
+                tentative_g_score = g_score[current] + movement_cost
+                
+                if neighbor not in open_set:
+                    open_set.add(neighbor)
+                elif tentative_g_score >= g_score.get(neighbor, float('inf')):
+                    continue
+                
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g_score
+                f_score[neighbor] = g_score[neighbor] + self.heuristic(neighbor, goal)
+        
+        return None
+
+    def smooth_path(self, path, smoothing_strength=0.5):
+        """
+        使用加權平均對路徑進行平滑處理
+        """
+        if len(path) <= 2:
+            return path
+        
+        smoothed = []
+        smoothed.append(path[0])  # 保持起點不變
+        
+        for i in range(1, len(path)-1):
+            prev = np.array(path[i-1])
+            current = np.array(path[i])
+            next_point = np.array(path[i+1])
+            
+            # 計算平滑後的點
+            smoothed_point = (
+                current * (1 - smoothing_strength) +
+                (prev + next_point) * smoothing_strength / 2
+            )
+            
+            # 確保平滑後的點不會太靠近障礙物
+            img_x, img_y = self.gazebo_to_image_coords(*smoothed_point)
+            if self.is_valid_point((img_x, img_y)):
+                smoothed.append(tuple(smoothed_point))
+            else:
+                smoothed.append(path[i])
+        
+        smoothed.append(path[-1])  # 保持終點不變
+        return smoothed
+
+    def is_valid_point(self, point):
+        """
+        檢查點是否有效（不在障礙物內且在地圖範圍內）
+        """
+        x, y = point
+        
+        # 檢查是否在地圖範圍內
+        if not (0 <= x < self.slam_map.shape[1] and 0 <= y < self.slam_map.shape[0]):
+            return False
+        
+        # 檢查是否在障礙物內或太靠近障礙物
+        safety_margin = 5  # 像素單位的安全邊距
+        region = self.slam_map[
+            max(0, y-safety_margin):min(y+safety_margin, self.slam_map.shape[0]),
+            max(0, x-safety_margin):min(x+safety_margin, self.slam_map.shape[1])
+        ]
+        
+        # 檢查區域內是否有障礙物（牆壁或膨脹區域）
+        if np.any(region < 250):  # 假設 < 250 的值表示障礙物或膨脹區域
+            return False
+        
+        return True
+    
+    # 第一部份
+    def initialize_path_planning(self):
+        """初始化路徑規劃過程"""
+        self.load_slam_map('/home/ash/Downloads/0822-1floor/my_map0924.yaml')
+        self.generate_costmap()
+        
+        # 2. 獲取參考 waypoints
+        reference_waypoints = self.generate_random_waypoints()
+        
+        # 3. 使用 A* 生成基礎路徑
+        start_point = reference_waypoints[0]
+        goal_point = (self.target_x, self.target_y)
+        print("準備進行a star 規劃")
+        self.base_path = self.full_a_star_planning(start_point, goal_point)
+        
+        # 4. 將基礎路徑分段，準備進行強化學習優化
+        self.segment_path(segment_length=10)  # 每10個點作為一
+
+        transformed_waypoints = []
+        for point in reference_waypoints:
+            img_x, img_y = self.gazebo_to_image_coords(*point)
+            transformed_waypoints.append((img_x, img_y))
+        return transformed_waypoints
+
+    def segment_path(self, segment_length):
+        """將基礎路徑分段"""
+        if self.base_path is None:
+            return
+            
+        self.path_segments = []
+        for i in range(0, len(self.base_path), segment_length):
+            segment = self.base_path[i:i + segment_length]
+            if len(segment) >= 2:  # 確保段至少有起點和終點
+                self.path_segments.append(segment)
+                
+    def optimize_path_segment(self, segment_index):
+        """使用強化學習優化特定路徑段"""
+        if segment_index >= len(self.path_segments):
+            return None
+            
+        current_segment = self.path_segments[segment_index]
+        start_point = current_segment[0]
+        end_point = current_segment[-1]
+        
+        # 設置環境起始狀態
+        self.reset_to_position(start_point)
+        
+        # 進行強化學習優化
+        optimized_path = []
+        state = self.get_current_state()
+        
+        while not self.is_near_goal(self.get_robot_position()[:2], end_point):
+            action = self.model.act(torch.tensor(state, device=device))
+            next_state, reward, done, _ = self.step(action)
+            
+            current_position = self.get_robot_position()[:2]
+            optimized_path.append(current_position)
+            
+            if done:
+                break
+                
+            state = next_state
+            
+        return optimized_path
+        
+    def execute_optimized_navigation(self):
+        """執行優化後的導航"""
+        # 初始化路徑規劃
+        self.initialize_path_planning()
+        
+        # 開始分段優化
+        for i in range(len(self.path_segments)):
+            print(f"Optimizing segment {i+1}/{len(self.path_segments)}")
+            
+            # 對當前段進行多次優化
+            best_segment_path = None
+            best_segment_reward = float('-inf')
+            
+            for attempt in range(5):  # 每段優化5次
+                optimized_segment = self.optimize_path_segment(i)
+                if optimized_segment:
+                    segment_reward = self.evaluate_segment(optimized_segment)
+                    if segment_reward > best_segment_reward:
+                        best_segment_path = optimized_segment
+                        best_segment_reward = segment_reward
+                        
+            # 儲存最佳優化結果
+            if best_segment_path:
+                self.optimized_segments[i] = best_segment_path
+                
+        return self.create_final_path()
+        
+    def create_final_path(self):
+        """合併所有優化後的路徑段"""
+        final_path = []
+        for i in range(len(self.path_segments)):
+            if i in self.optimized_segments:
+                final_path.extend(self.optimized_segments[i])
+            else:
+                final_path.extend(self.path_segments[i])
+        return final_path
+
+    def heuristic(self, start, goal):
+        dx, dy = goal[0] - start[0], goal[1] - start[1]
+        return np.sqrt(dx**2 + dy**2) + np.abs(dx) * 0.5 + np.abs(dy) * 0.5
+
+    def is_near_goal(self, current, goal, threshold=5):
+        """檢查是否到達目標點"""
+        distance = np.sqrt((current[0] - goal[0])**2 + (current[1] - goal[1])**2)
+        return distance < threshold
+
+    def reset_to_position(self, position):
+        """重置機器人到指定位置"""
+        x, y = position
+        state_msg = ModelState()
+        state_msg.model_name = 'my_robot'
+        state_msg.pose.position.x = x
+        state_msg.pose.position.y = y
+        state_msg.pose.position.z = 0.2  # 設置適當的高度
+        
+        # 保持原始方向
+        quaternion = quaternion_from_euler(0.0, 0.0, 0.0)
+        state_msg.pose.orientation.x = quaternion[0]
+        state_msg.pose.orientation.y = quaternion[1]
+        state_msg.pose.orientation.z = quaternion[2]
+        state_msg.pose.orientation.w = quaternion[3]
+        
+        try:
+            self.set_model_state(state_msg)
+            rospy.sleep(0.1)  # 等待位置更新
+            return self.generate_occupancy_grid(x, y)
+        except rospy.ServiceException as e:
+            rospy.logerr(f"Reset position failed: {e}")
+            return None
+
+    def get_current_state(self):
+        """獲取當前狀態"""
+        robot_x, robot_y, _ = self.get_robot_position()
+        return self.generate_occupancy_grid(robot_x, robot_y)
+
+    def evaluate_segment(self, segment):
+        """評估路徑段的品質"""
+        if not segment:
+            return float('-inf')
+        
+        total_reward = 0
+        for i in range(len(segment)-1):
+            # 計算相鄰點間的距離
+            dist = np.linalg.norm([segment[i+1][0] - segment[i][0], 
+                                segment[i+1][1] - segment[i][1]])
+            # 檢查點是否在可行區域內
+            img_x, img_y = self.gazebo_to_image_coords(segment[i][0], segment[i][1])
+            if not self.is_valid_point((img_x, img_y)):
+                return float('-inf')
+                
+            # 計算平滑度（與前後點的角度）
+            if i > 0:
+                v1 = np.array(segment[i]) - np.array(segment[i-1])
+                v2 = np.array(segment[i+1]) - np.array(segment[i])
+                angle = np.arccos(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+                smoothness_penalty = -angle * 10  # 角度越大，懲罰越大
+                total_reward += smoothness_penalty
+                
+            total_reward += -dist  # 距離越短越好
+            
+        return total_reward
+
 class ActorCritic(nn.Module):
     def __init__(self, observation_space, action_space):
         super(ActorCritic, self).__init__()
@@ -840,7 +1168,6 @@ class ActorCritic(nn.Module):
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
         
-
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
         x = torch.relu(self.bn1(self.conv1(x)))
@@ -929,93 +1256,70 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+#--------------
+def load_slam_map(self, yaml_path):
+        # 讀取 YAML 檔案
+        with open(yaml_path, 'r') as file:
+            map_metadata = yaml.safe_load(file)
+            self.map_origin = map_metadata['origin']  # 地圖原點
+            self.map_resolution = map_metadata['resolution']  # 地圖解析度
+            png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
+            
+            # 使用 PIL 讀取PNG檔
+            png_image = Image.open(png_path).convert('L')
+            self.slam_map = np.array(png_image)  # 轉為NumPy陣列
 
 def main():
+    # 初始化环境
     env = GazeboEnv(None)
     model = ActorCritic(env.observation_space, env.action_space).to(device)
     env.model = model
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     memory = PrioritizedMemory(MEMORY_SIZE)
 
-    model_path = "/home/ash/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
-    best_model_path = "/home/ash/catkin_ws/src/my_robot_control/scripts/best_model.pth"
+    # 初始化路径规划
+    random_waypoints = env.initialize_path_planning()
+    random_waypoints = np.array(random_waypoints)
+
+    # 获取随机生成的路径点
+    # random_waypoints = env.generate_random_waypoints()
+    # random_waypoints = np.array(random_waypoints)
+
+    # 检查并处理路径规划结果
+    if env.base_path is None or len(env.base_path) == 0:
+        print("A* did not find a valid path. Visualization skipped.")
+        return
+
+    # 转换路径为 NumPy 数组并检查格式
+    path = np.array(env.base_path)
+    if path.ndim != 2 or path.shape[1] != 2:
+        raise ValueError(f"Path data has unexpected dimensions: {path.shape}")
+
+    # 可视化路径和代价地图
+    plt.figure(figsize=(12, 8))
+    plt.imshow(env.cost_map, cmap='gray', origin='lower')
     
-    # 加载已有模型
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print("Loaded existing model.")
-    else:
-        print("Created new model.")
-
-    num_episodes = 1000000
-    best_test_reward = -np.inf
-
-    for e in range(num_episodes):
-        # 优化路径点
-        if not env.optimized_waypoints_calculated:
-            env.optimize_waypoints_with_a_star()
-
-        # 环境重置
-        state = env.reset()
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=torch.float32)
-        state = state.clone().detach().unsqueeze(0).to(device)
-
-        total_reward = 0
-        start_time = time.time()
-
-        for time_step in range(1500):
-            # 模型选择动作
-            action = model.act(state)
-            action_np = action.detach().cpu().numpy()
-            
-            # 执行环境步进
-            next_state, reward, done, _ = env.step(action_np)
-
-            if not isinstance(next_state, torch.Tensor):
-                next_state = torch.tensor(next_state, dtype=torch.float32)
-            next_state = next_state.clone().detach().unsqueeze(0).to(device)
-
-            # 添加到记忆体
-            memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-            
-            # 更新当前状态和累计奖励
-            state = next_state
-            total_reward += reward
-
-            # 超时或结束条件
-            elapsed_time = time.time() - start_time
-            if done or elapsed_time > 240:
-                if elapsed_time > 240:
-                    reward -= 1000.0
-                    print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
-                break
-
-        # 更新 PPO
-        try:
-            ppo_update(PPO_EPOCHS, env, model, optimizer, memory)
-        except ValueError as ve:
-            print(f"Memory issue during PPO update: {ve}")
-        memory.clear()
-
-        print(f"Episode {e}, Total Reward: {total_reward}")
-
-        # 保存最佳模型
-        if total_reward > best_test_reward:
-            best_test_reward = total_reward
-            torch.save(model.state_dict(), best_model_path)
-            print(f"New best model saved with reward: {best_test_reward}")
-
-        # 定期保存模型
-        if e % 5 == 0:
-            torch.save(model.state_dict(), model_path)
-            print(f"Model saved after {e} episodes.")
-
-        rospy.sleep(1.0)
-
-    # 保存最终模型
-    torch.save(model.state_dict(), model_path)
-    print("Final model saved.")
+    # 绘制 A* 路径
+    plt.plot(path[:, 0], path[:, 1], 'r-', label='Initial A* path', linewidth=2)
+    
+    # 绘制随机路径点
+    plt.scatter(random_waypoints[:, 0], random_waypoints[:, 1], 
+               color='yellow', s=50, label='Random Waypoints', zorder=4)
+    
+    # 连接随机路径点
+    plt.plot(random_waypoints[:, 0], random_waypoints[:, 1], 
+            'y--', alpha=0.5, label='Random Waypoints Path', zorder=3)
+    
+    # 标记起点和终点
+    plt.scatter(path[0, 0], path[0, 1], color='green', s=100, label='Start', zorder=5)
+    plt.scatter(path[-1, 0], path[-1, 1], color='blue', s=100, label='Goal', zorder=5)
+    
+    plt.title('Path Planning Visualization')
+    plt.xlabel('X Coordinate')
+    plt.ylabel('Y Coordinate')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
 
 if __name__ == '__main__':
     # main()
