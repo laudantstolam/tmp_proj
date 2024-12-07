@@ -768,21 +768,15 @@ class DWA:
         self.goal = goal
         self.robot_radius = 0.3
 
-    def calc_dynamic_window(self, state):
-        # 當前速度限制
-        vs = [0, self.max_speed, -self.max_yaw_rate, self.max_yaw_rate]
-        dw = vs
-        return dw
-
     def motion(self, state, control):
         # 運動模型計算下一步
         x, y, theta, v, omega = state
         next_x = x + v * np.cos(theta) * self.dt
         next_y = y + v * np.sin(theta) * self.dt
         next_theta = theta + omega * self.dt
-        next_v = control[0]
-        next_omega = control[1]
-        return [next_x, next_y, next_theta, next_v, next_omega]
+        # next_v = control[0]
+        # next_omega = control[1]
+        return [next_x, next_y, next_theta, control[0], control[1]]
 
     def calc_trajectory(self, state, control):
         # 預測軌跡
@@ -812,34 +806,41 @@ class DWA:
         return goal_score, clearance_score, speed_score
 
     def plan(self, state, obstacles):
-        print("dwa goal: ", self.goal)
-        # 獲取動態窗口
-        obstacles = [(ox, oy) for ox, oy in obstacles]
-        dw = self.calc_dynamic_window(state)  # 速度 角度限制
-        # 遍歷動態窗口中的所有控制
-        best_trajectory = None
-        best_score = -100.0
-        best_control = [0.0, 0.0]
-        # print("Dynamic Window", dw)
-        for v in np.arange(dw[0], dw[1], 0.2):  # 線速度範圍
-            for omega in np.arange(dw[2], dw[3], 0.1):  # 角速度範圍
-
-                # 模擬軌跡
-                control = [v, omega]
-                trajectory = self.calc_trajectory(state, control)
-                # 計算評分函數
-                goal_score, clearance_score, speed_score = self.calc_score(trajectory, obstacles)
-                total_score = goal_score * 0.5 + clearance_score * 0.45 + speed_score * 0.05
-
-                # 找到最佳控制
-                if total_score > best_score:
-                    best_score = total_score
-                    best_trajectory = trajectory
-                    best_control = control
-        print(
-            f"v: {v}, omega: {omega}, goal_score: {goal_score}, clearance_score: {clearance_score}, speed_score: {speed_score}")
-        return best_control, best_trajectory
-
+        print("dwa goal:", self.goal)
+        
+        # 設定動態窗口範圍
+        dw = {
+            'v_range': np.arange(0, self.max_speed, 0.2),
+            'w_range': np.arange(-self.max_yaw_rate, self.max_yaw_rate, 0.1)
+        }
+        
+        # 初始化最佳參數
+        best = {
+            'score': -100.0,
+            'trajectory': None,
+            'control': [0.0, 0.0]
+        }
+        
+        # 遍歷所有可能的控制組合
+        for v in dw['v_range']:
+            for w in dw['w_range']:
+                trajectory = self.calc_trajectory(state, [v, w])
+                
+                # 計算各項評分
+                scores = self.calc_score(trajectory, obstacles)
+                total_score = sum(s * w for s, w in zip(scores, [0.5, 0.45, 0.05]))
+                
+                # 更新最佳結果
+                if total_score > best['score']:
+                    best.update({
+                        'score': total_score,
+                        'trajectory': trajectory,
+                        'control': [v, w]
+                    })
+                    
+                    print(f"v: {v}, w: {w}, scores: {scores}")
+                    
+        return best['control'], best['trajectory']
 
 def calculate_bounding_box(robot_x, robot_y, robot_yaw):
     # 机器人中心到边界的相对距离
@@ -942,7 +943,7 @@ def main():
 
         state = env.reset()
 
-        total_reward = 0
+        # total_reward = 0
         start_time = time.time()
 
         for time_step in range(1500):
