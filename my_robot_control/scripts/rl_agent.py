@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import csv
 import datetime
+import os
+import sys
 import time
 from collections import namedtuple
 
@@ -10,8 +12,6 @@ import numpy as np
 import rospy
 import tf
 import yaml
-import os
-import sys
 from PIL import Image
 from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import SetModelState, GetModelState
@@ -40,26 +40,20 @@ Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state'
 
 
 class GazeboEnv:
-    def __init__(self, model):
+    def __init__(self, target: tuple[float, float]):
         rospy.init_node('gazebo_rl_agent', anonymous=True)
-        self.model = model
         self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.pub_imu = rospy.Publisher('/imu/data', Imu, queue_size=10)
         self.set_model_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
         self.get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
         self.listener = tf.TransformListener()
-        self.action_space = 2
-        self.observation_space = (3, 64, 64)
-        self.state = np.zeros(self.observation_space)
+        self.state = np.zeros((3, 64, 64))
         self.done = False
-        self.target_x = -7.2213
-        self.target_y = -1.7003
+        self.target_x, self.target_y = target
         self.waypoints = waypoints
         self.waypoint_distances = self.calculate_waypoint_distances()  # 計算一整圈機器人要走的大致距離
-        self.total_path_distance = sum(self.waypoint_distances)  # 計算總路徑距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
-        self.epsilon = 0.05
         self.previous_robot_position = None  # 初始化 previous_robot_position 為 None
         self.previous_distance_to_goal = None  # 初始化 previous_distance_to_goal 為 None
 
@@ -246,7 +240,7 @@ class GazeboEnv:
             self.g_scores[(x, y)] = g
 
             # 正規化 g 值
-            g_normalized = (g * 0.05) / self.total_path_distance
+            g_normalized = (g * 0.05) / sum(self.waypoint_distances)
 
             # 当前点到目标点的 h 值（启发式）
             h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
@@ -917,7 +911,8 @@ def grid_filter(obstacles, grid_size=0.5):
 
 
 def main():
-    env = GazeboEnv(None)
+    target = (-7.2213, -1.7003)
+    env = GazeboEnv(target=target)
     dwa = DWA(goal=env.waypoints[env.current_waypoint_index + 3])
 
     env.visualize_original_path()
