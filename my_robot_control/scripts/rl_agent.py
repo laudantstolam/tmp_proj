@@ -19,7 +19,7 @@ from sensor_msgs.msg import Imu
 from skimage.draw import line
 from tf.transformations import quaternion_from_euler
 
-from my_robot_control.waypoints import waypoints
+from my_robot_control.scripts.waypoints import waypoints
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
