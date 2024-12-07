@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rospy
 import tf
-import yaml
 from PIL import Image
 from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import SetModelState, GetModelState
@@ -67,36 +66,20 @@ class GazeboEnv:
         self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
 
         # 加载SLAM地圖
-        self.load_slam_map('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.yaml')
+        self.slam_map = np.array(
+            Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map1205.png').convert('L'))
+        self.cost_map = self.generate_costmap()
 
         self.optimize_waypoints_with_a_star()
 
-    def load_slam_map(self, yaml_path):
-        # 讀取 YAML 檔案
-        with open(yaml_path, 'r') as file:
-            map_metadata = yaml.safe_load(file)
-            self.map_origin = map_metadata['origin']  # 地圖原點
-            self.map_resolution = map_metadata['resolution']  # 地圖解析度
-            png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
-
-            # 使用 PIL 讀取PNG檔
-            png_image = Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map1205.png').convert('L')
-            self.slam_map = np.array(png_image)  # 轉為NumPy陣列
-
-        self.generate_costmap()
-
     def generate_costmap(self):
-        if self.slam_map is None:
-            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
-            return False
-
         wall_color = np.array([100, 100, 100])
         wall_color2 = np.array([120, 120, 120])
 
         img = cv2.cvtColor(self.slam_map, cv2.COLOR_GRAY2BGR)
         wall_mask = cv2.inRange(img, wall_color, wall_color2)
 
-        self.cost_map = np.zeros_like(self.slam_map)
+        cost_map = np.zeros_like(self.slam_map)
 
         inner_dilation = 3
         outer_dilation = 6
@@ -109,12 +92,12 @@ class GazeboEnv:
 
         outer_only = cv2.subtract(outer_dilated, inner_dilated)
 
-        self.cost_map[wall_mask > 0] = 254  # 障礙物設為最高代價
-        self.cost_map[inner_dilated > 0] = 190  # 內層膨脹區設為中高代價
-        self.cost_map[outer_only > 0] = 100  # 外層膨脹區設為中低代價
+        cost_map[wall_mask > 0] = 254  # 障礙物設為最高代價
+        cost_map[inner_dilated > 0] = 190  # 內層膨脹區設為中高代價
+        cost_map[outer_only > 0] = 100  # 外層膨脹區設為中低代價
 
         rospy.loginfo("Costmap generated successfully.")
-        return True
+        return cost_map
 
     def calculate_waypoint_distances(self):
         """
@@ -167,13 +150,6 @@ class GazeboEnv:
             return False
 
         return True
-
-    def calculate_min_distance_to_obstacles(self, x, y, kd_tree):
-        """
-        使用 KDTree 计算点 (x, y) 到障碍物的最小距离。
-        """
-        distance, _ = kd_tree.query((x, y))  # 查询最近邻距离
-        return distance
 
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, kd_tree, grid_size=50):
         if not hasattr(self, 'g_scores'):
@@ -267,7 +243,7 @@ class GazeboEnv:
                 smoothness_cost_normalized = 0
 
             # 基于 KDTree 计算最小障碍物距离
-            obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+            obstacle_distance = kd_tree.query((x, y))[0]
 
             # 正規化距离代价
             distance_penalty_normalized = -obstacle_distance / max_obstacle_distance if max_obstacle_distance > 0 else 0
