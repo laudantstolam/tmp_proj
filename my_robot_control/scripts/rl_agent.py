@@ -1,33 +1,23 @@
 #!/usr/bin/env python3
 import rospy
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import os
-from geometry_msgs.msg import Twist, PointStamped
-from sensor_msgs.msg import PointCloud2, Imu
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState, ContactsState
-import sensor_msgs.point_cloud2 as pc2
-from scipy.special import comb
+from gazebo_msgs.msg import ModelState
 from collections import namedtuple
-import cv2
-import open3d as o3d
 import tf
 from tf.transformations import quaternion_from_euler
 import time
-from torch.amp import GradScaler
 import yaml
 from PIL import Image
-import random
-from sklearn.cluster import KMeans
-import wandb
+import csv
 import cv2
-import numpy as np
-from PIL import Image
+import datetime
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+from scipy.spatial import KDTree
+from skimage.draw import line
+
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
 MEMORY_SIZE = 10000
@@ -39,126 +29,8 @@ CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
 
-device = torch.device("cpu")
+# device = torch.device("cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
-
-# def cluster_simplify(obstacles, n_clusters):  沒用了
-#     if len(obstacles) <= n_clusters:
-#         return obstacles
-#     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(obstacles)
-#     return kmeans.cluster_centers_.tolist()
-
-def grid_filter(obstacles, grid_size=0.5):
-    obstacles = np.array(obstacles)
-    # 按照 grid_size 取整
-    grid_indices = (obstacles // grid_size).astype(int)
-    # 找到唯一的网格
-    unique_indices = np.unique(grid_indices, axis=0)
-    # 返回网格中心点
-    filtered_points = unique_indices * grid_size + grid_size / 2
-    return filtered_points
-
-class PrioritizedMemory:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = [None] * capacity
-        self.position = 0
-        self.priorities = torch.zeros((capacity,), dtype=torch.float32).cuda()
-        self.alpha = 0.6
-        self.epsilon = 1e-5
-
-    def add(self, state, action, reward, done, next_state):
-        print(f"[Memory Add] Input State shape: {state.shape}, Next state shape: {next_state.shape}")
-
-        # 確保 state 和 next_state 的形狀統一
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float32)
-        if isinstance(next_state, np.ndarray):
-            next_state = torch.tensor(next_state, dtype=torch.float32)
-
-        if state.dim() == 5:
-            state = state.squeeze(1)
-        if next_state.dim() == 5:
-            next_state = next_state.squeeze(1)
-
-        print(f"[Memory Add] After adjusted State shape: {state.shape}, Next state shape: {next_state.shape}")
-
-        if state.shape != next_state.shape:
-            raise ValueError(f"[Memory Add] State and next_state shapes do not match: {state.shape} vs {next_state.shape}")
-        
-        # 其餘操作保持不變
-        max_priority = self.priorities.max() if self.memory[self.position] is not None else torch.tensor(1.0, device=device)
-        self.memory[self.position] = (
-            state.to(device),
-            torch.tensor(action, dtype=torch.float32, device=device),
-            torch.tensor(reward, dtype=torch.float32, device=device),
-            torch.tensor(done, dtype=torch.float32, device=device),
-            next_state.to(device)
-        )
-        self.priorities[self.position] = max_priority
-        self.position = (self.position + 1) % self.capacity
-        print(f"[Memory Add] Added sample at position {self.position}. Total samples: {sum(1 for x in self.memory if x is not None)}")
-
-
-    def sample(self, batch_size, beta=0.4):
-        # 確保有效樣本數量足夠
-        valid_samples = [sample for sample in self.memory if sample is not None]
-        print(f"[Memory Sample] Valid samples: {len(valid_samples)}, Requested batch size: {batch_size}")
-        if len(valid_samples) < batch_size:
-            print(f"Available samples: {len(valid_samples)}, requested batch size: {batch_size}")
-            raise ValueError("Sampled None from memory. Not enough valid samples.")
-
-        # 抽取樣本
-        priorities = self.priorities[:self.position] if self.position < self.capacity else self.priorities
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
-
-        indices = torch.multinomial(probabilities, batch_size, replacement=False).cuda()
-        print(f"[Memory Sample] Selected indices: {indices}")
-        samples = [self.memory[idx] for idx in indices if self.memory[idx] is not None]
-
-        weights = (len(self.memory) * probabilities[indices]) ** (-beta)
-        weights /= weights.max()
-
-        batch = list(zip(*samples))
-        states, actions, rewards, dones, next_states = batch
-
-        # 確保數據形狀正確
-        states = torch.stack([state.squeeze(0) if state.dim() > 4 else state for state in states]).to(device)
-        next_states = torch.stack([next_state.squeeze(0) if next_state.dim() > 4 else next_state for next_state in next_states]).to(device)
-        actions = torch.stack(actions).to(device)
-        rewards = torch.stack(rewards).to(device)
-        dones = torch.stack(dones).to(device)
-        
-        print(f"[Memory Sample] State shape after stack: {states.shape}, Next state shape after stack: {next_states.shape}")
-
-        # 打印形狀以進一步檢查
-        print(f"[Memory Sample] Shapes - states: {states.shape}, next_states: {next_states.shape}, actions: {actions.shape}, rewards: {rewards.shape}, dones: {dones.shape}")
-
-        return (
-            states,
-            actions,
-            rewards,
-            dones,
-            next_states,
-            indices,
-            weights.to(device)
-        )
-
-
-
-    def update_priorities(self, batch_indices, batch_priorities):
-        # 確保每個 priority 是單一標量
-        for idx, priority in zip(batch_indices, batch_priorities):
-            # 如果 priority 是 numpy 陣列，檢查其 size
-            if priority.size > 1:
-                priority = priority[0]
-            self.priorities[idx] = priority.item() + self.epsilon
-
-    def clear(self):
-        self.position = 0
-        self.memory = [None] * self.capacity
-        self.priorities = torch.zeros((self.capacity,), dtype=torch.float32).cuda()
 
 class GazeboEnv:
     def __init__(self, model):
@@ -173,14 +45,14 @@ class GazeboEnv:
         self.observation_space = (3, 64, 64)
         self.state = np.zeros(self.observation_space)
         self.done = False
-        self.target_x = -5.3334
-        self.target_y = -0.3768    
+        self.target_x = -7.2213
+        self.target_y = -1.7003  
         self.waypoints = self.generate_waypoints()
-        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器任要奏的大致距離
+        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器人要走的大致距離
+        self.total_path_distance = sum(self.waypoint_distances)  # 計算總路徑距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
-        self.collision_detected = False
         self.previous_robot_position = None  # 初始化 previous_robot_position 為 None
         self.previous_distance_to_goal = None  # 初始化 previous_distance_to_goal 為 None
 
@@ -194,11 +66,10 @@ class GazeboEnv:
         self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
 
         # 加载SLAM地圖
-        self.load_slam_map('/home/ash/Downloads/0822-1floor/my_map0924.yaml')
+        self.load_slam_map('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.yaml')
 
         self.optimize_waypoints_with_a_star()
-        
-        self.sub_contacts = rospy.Subscriber('/gazebo/contacts', ContactsState, self.collision_callback)
+    
     def load_slam_map(self, yaml_path):
         # 讀取 YAML 檔案
         with open(yaml_path, 'r') as file:
@@ -208,172 +79,214 @@ class GazeboEnv:
             png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
             
             # 使用 PIL 讀取PNG檔
-            png_image = Image.open('//home/ash/Downloads/0822-1floor/my_map0924.png').convert('L')
+            png_image = Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map1205.png').convert('L')
             self.slam_map = np.array(png_image)  # 轉為NumPy陣列
 
+        self.generate_costmap()
+    
+    def generate_costmap(self):
+        if self.slam_map is None:
+            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
+            return False
+
+        wall_color = np.array([100, 100, 100])
+        wall_color2 = np.array([120, 120, 120])
+        
+        img = cv2.cvtColor(self.slam_map, cv2.COLOR_GRAY2BGR)
+        wall_mask = cv2.inRange(img, wall_color, wall_color2)
+        
+        self.cost_map = np.zeros_like(self.slam_map)
+        
+        inner_dilation = 3
+        outer_dilation = 6
+        
+        inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
+        inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
+        
+        outer_kernel = np.ones((outer_dilation * 2 + 1, outer_dilation * 2 + 1), np.uint8)
+        outer_dilated = cv2.dilate(wall_mask, outer_kernel, iterations=1)
+        
+        outer_only = cv2.subtract(outer_dilated, inner_dilated)
+        
+        self.cost_map[wall_mask > 0] = 254        # 障礙物設為最高代價
+        self.cost_map[inner_dilated > 0] = 190    # 內層膨脹區設為中高代價
+        self.cost_map[outer_only > 0] = 100        # 外層膨脹區設為中低代價
+        
+        rospy.loginfo("Costmap generated successfully.")
+        return True
 
     def generate_waypoints(self):
-        waypoints = [
-            (0.2206, 0.1208),
-            (1.2812, 0.0748),
-            (2.3472, 0.129),
-            (3.4053, 0.1631),
-            (4.4468, 0.1421),
-            (5.5032, 0.1996),
-            (6.5372, 0.2315),
-            (7.5948, 0.2499),
-            (8.6607, 0.3331),
-            (9.6811, 0.3973),
-            (10.6847, 0.4349),
-            (11.719, 0.4814),
-            (12.7995, 0.5223),
-            (13.8983, 0.515),
-            (14.9534, 0.6193),
-            (15.9899, 0.7217),
-            (17.0138, 0.7653),
-            (18.0751, 0.8058),
-            (19.0799, 0.864),
-            (20.1383, 0.936),
-            (21.1929, 0.9923),
-            (22.2351, 1.0279),
-            (23.3374, 1.1122),
-            (24.4096, 1.1694),
-            (25.4817, 1.2437),
-            (26.5643, 1.3221),
-            (27.6337, 1.4294),
-            (28.6643, 1.4471),
-            (29.6839, 1.4987),
-            (30.7, 1.58),
-            (31.7796, 1.6339),
-            (32.8068, 1.7283),
-            (33.8596, 1.8004),
-            (34.9469, 1.9665),
-            (35.9883, 1.9812),
-            (37.0816, 2.0237),
-            (38.1077, 2.1291),
-            (39.1405, 2.1418),
-            (40.1536, 2.2273),
-            (41.1599, 2.2473),
-            (42.2476, 2.2927),
-            (43.3042, 2.341),
-            (44.4049, 2.39),
-            (45.5091, 2.4284),
-            (46.579, 2.5288),
-            (47.651, 2.4926),
-            (48.6688, 2.6072),
-            (49.7786, 2.6338),
-            (50.7942, 2.6644),
-            (51.868, 2.7625),
-            (52.9149, 2.8676),
-            (54.0346, 2.9602),
-            (55.0855, 2.9847),
-            (56.1474, 3.1212),
-            (57.2397, 3.2988),
-            (58.2972, 3.5508),
-            (59.1103, 4.1404),
-            (59.6059, 5.1039),
-            (59.6032, 6.2015),
-            (59.4278, 7.212),
-            (59.3781, 8.2782),
-            (59.4323, 9.2866),
-            (59.3985, 10.304),
-            (59.3676, 11.3302),
-            (59.3193, 12.3833),
-            (59.359, 13.4472),
-            (59.3432, 14.4652),
-            (59.3123, 15.479),
-            (59.1214, 16.4917),
-            (58.7223, 17.4568),
-            (57.8609, 18.1061),
-            (56.8366, 18.3103),
-            (55.7809, 18.0938),
-            (54.7916, 17.707),
-            (53.7144, 17.5087),
-            (52.6274, 17.3683),
-            (51.6087, 17.1364),
-            (50.5924, 17.0295),
-            (49.5263, 16.9058),
-            (48.4514, 16.7769),
-            (47.3883, 16.6701),
-            (46.3186, 16.5403),
-            (45.3093, 16.4615),
-            (44.263, 16.299),
-            (43.2137, 16.1486),
-            (42.171, 16.0501),
-            (41.1264, 16.0245),
-            (40.171, 16.7172),
-            (39.1264, 16.8428),
-            (38.1122, 17.019),
-            (37.2234, 16.5322),
-            (36.6845, 15.6798),
-            (36.3607, 14.7064),
-            (35.5578, 13.9947),
-            (34.5764, 13.7466),
-            (33.5137, 13.6068),
-            (32.4975, 13.5031),
-            (31.5029, 13.3368),
-            (30.4162, 13.1925),
-            (29.3894, 13.067),
-            (28.3181, 12.9541),
-            (27.3195, 12.8721),
-            (26.2852, 12.8035),
-            (25.241, 12.6952),
-            (24.1598, 12.6435),
-            (23.0712, 12.5947),
-            (21.9718, 12.5297),
-            (20.9141, 12.4492),
-            (19.8964, 12.3878),
-            (18.7163, 12.32),
-            (17.6221, 12.2928),
-            (16.5457, 12.2855),
-            (15.5503, 12.1534),
-            (14.4794, 12.0462),
-            (13.4643, 11.9637),
-            (12.3466, 11.7943),
-            (11.2276, 11.6071),
-            (10.2529, 12.0711),
-            (9.7942, 13.0066),
-            (9.398, 13.9699),
-            (8.6017, 14.7268),
-            (7.4856, 14.8902),
-            (6.5116, 14.4724),
-            (5.4626, 14.1256),
-            (4.3911, 13.9535),
-            (3.3139, 13.8013),
-            (2.2967, 13.7577),
-            (1.2165, 13.7116),
-            (0.1864, 13.6054),
-            (-0.9592, 13.4747),
-            (-2.0086, 13.352),
-            (-3.0267, 13.3358),
-            (-4.0117, 13.5304),
-            (-5.0541, 13.8047),
-            (-6.0953, 13.9034),
-            (-7.1116, 13.8871),
-            (-8.152, 13.8062),
-            (-9.195, 13.7043),
-            (-10.2548, 13.6152),
-            (-11.234, 13.3289),
-            (-11.9937, 12.6211),
-            (-12.3488, 11.6585),
-            (-12.4231, 10.6268),
-            (-12.3353, 9.5915),
-            (-12.2405, 8.5597),
-            (-12.1454, 7.4974),
-            (-12.0596, 6.4487),
-            (-12.0537, 5.3613),
-            (-12.0269, 4.2741),
-            (-11.999, 3.2125),
-            (-11.9454, 2.2009),
-            (-11.7614, 1.1884),
-            (-11.2675, 0.2385),
-            (-10.5404, -0.58),
-            (-9.4494, -0.8399),
-            (-8.3965, -0.8367),
-            (-7.3912, -0.6242),
-            (-6.3592, -0.463),
-            (self.target_x, self.target_y)
-        ]
+        waypoints = [(-6.4981, -1.0627),
+            (-5.4541, -1.0117),
+            (-4.4041, -0.862),
+            (-3.3692, -1.0294),
+            (-2.295, -1.114),
+            (-1.2472, -1.0318),
+            (-0.1614, -0.6948),
+            (0.8931, -0.8804),
+            (1.9412, -0.8604),
+            (2.9804, -0.7229),
+            (3.874, -0.2681),
+            (4.9283, -0.1644),
+            (5.9876, -0.345),
+            (7.019, -0.5218),
+            (7.9967, -0.2338),
+            (9.0833, -0.1096),
+            (10.1187, -0.3335),
+            (11.1745, -0.6322),
+            (12.1693, -0.8619),
+            (13.1291, -0.4148),
+            (14.1217, -0.0282),
+            (15.1261, 0.123),
+            (16.1313, 0.4439),
+            (17.1389, 0.696),
+            (18.1388, 0.6685),
+            (19.2632, 0.5127),
+            (20.2774, 0.2655),
+            (21.2968, 0.0303),
+            (22.3133, -0.0192),
+            (23.2468, 0.446),
+            (24.1412, 0.9065),
+            (25.1178, 0.5027),
+            (26.1279, 0.4794),
+            (27.0867, 0.8266),
+            (28.0713, 1.4229),
+            (29.1537, 1.3866),
+            (30.2492, 1.1549),
+            (31.385, 1.0995),
+            (32.4137, 1.243),
+            (33.4134, 1.5432),
+            (34.4137, 1.5904),
+            (35.4936, 1.5904),
+            (36.5067, 1.5607),
+            (37.5432, 1.5505),
+            (38.584, 1.7008),
+            (39.6134, 1.9053),
+            (40.5979, 2.0912),
+            (41.6557, 2.3779),
+            (42.5711, 2.8643),
+            (43.5911, 2.9725),
+            (44.5929, 3.0637),
+            (45.5919, 2.9841),
+            (46.6219, 2.9569),
+            (47.6314, 3.0027),
+            (48.7359, 2.832),
+            (49.5462, 2.1761),
+            (50.5982, 2.1709),
+            (51.616, 2.3573),
+            (52.6663, 2.5593),
+            (53.7532, 2.5325),
+            (54.7851, 2.5474),
+            (55.8182, 2.5174),
+            (56.8358, 2.6713),
+            (57.8557, 2.8815),
+            (58.8912, 3.0949),
+            (59.7436, 3.6285),
+            (60.5865, 4.2367),
+            (60.6504, 5.2876),
+            (60.7991, 6.3874),
+            (60.322, 7.3094),
+            (59.8004, 8.1976),
+            (59.4093, 9.195),
+            (59.1417, 10.1994),
+            (59.1449, 11.2274),
+            (59.5323, 12.2182),
+            (59.8637, 13.2405),
+            (60.5688, 14.0568),
+            (60.6266, 15.1571),
+            (60.007, 15.9558),
+            (59.0539, 17.0128),
+            (57.9671, 17.326),
+            (56.9161, 16.7399),
+            (55.9553, 17.0346),
+            (54.9404, 17.0596),
+            (53.9559, 16.8278),
+            (52.9408, 16.8697),
+            (51.9147, 16.7642),
+            (50.9449, 16.4902),
+            (49.9175, 16.3029),
+            (48.8903, 16.1165),
+            (47.7762, 16.0994),
+            (46.7442, 16.0733),
+            (45.7566, 15.8195),
+            (44.756, 15.7218),
+            (43.7254, 15.9309),
+            (42.6292, 15.8439),
+            (41.6163, 15.8177),
+            (40.5832, 15.7881),
+            (39.5617, 15.773),
+            (38.5099, 15.5648),
+            (37.692, 14.9481),
+            (36.8538, 14.3078),
+            (35.8906, 13.8384),
+            (34.8551, 13.6316),
+            (33.8205, 13.5495),
+            (32.7391, 13.4423),
+            (31.7035, 13.1056),
+            (30.6971, 12.7802),
+            (29.6914, 12.5216),
+            (28.7072, 12.3238),
+            (27.6442, 12.0953),
+            (26.5991, 11.9873),
+            (25.5713, 11.9867),
+            (24.488, 12.0679),
+            (23.4441, 12.0246),
+            (22.3169, 11.7745),
+            (21.3221, 11.538),
+            (20.3265, 11.4243),
+            (19.2855, 11.5028),
+            (18.2164, 11.5491),
+            (17.1238, 11.6235),
+            (16.0574, 11.4029),
+            (14.982, 11.2479),
+            (13.9491, 11.0487),
+            (12.9017, 11.1455),
+            (11.8915, 11.4186),
+            (10.8461, 11.6079),
+            (9.9029, 12.0097),
+            (9.0549, 12.5765),
+            (8.4289, 13.4238),
+            (7.4035, 13.6627),
+            (6.3785, 13.5659),
+            (5.3735, 13.4815),
+            (4.3971, 13.1044),
+            (3.3853, 13.2918),
+            (2.3331, 13.0208),
+            (1.2304, 12.9829),
+            (0.2242, 13.094),
+            (-0.807, 12.9358),
+            (-1.8081, 12.8495),
+            (-2.7738, 13.3168),
+            (-3.4822, 14.0699),
+            (-4.5285, 14.2483),
+            (-5.5965, 13.9753),
+            (-6.5324, 13.6016),
+            (-7.3092, 12.8632),
+            (-8.3255, 12.9916),
+            (-9.1914, 13.7593),
+            (-10.2374, 14.069),
+            (-11.2162, 13.7566),
+            (-11.653, 12.8061),
+            (-11.6989, 11.7238),
+            (-11.8899, 10.7353),
+            (-12.6174, 10.0373),
+            (-12.7701, 8.9551),
+            (-12.4859, 7.9523),
+            (-12.153, 6.8903),
+            (-12.4712, 5.819),
+            (-13.0498, 4.8729),
+            (-13.1676, 3.8605),
+            (-12.4328, 3.1822),
+            (-12.1159, 2.1018),
+            (-12.8436, 1.2659),
+            (-13.3701, 0.2175),
+            (-13.0514, -0.8866),
+            (-12.3046, -1.619),
+            (-11.2799, -1.472),
+            (-10.1229, -1.3051),
+            (-9.1283, -1.4767),
+            (-8.1332, -1.2563),
+            (self.target_x, self.target_y)]
         return waypoints
     
     def calculate_waypoint_distances(self):
@@ -388,7 +301,6 @@ class GazeboEnv:
             distances.append(distance)
         return distances
 
-
     def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
         img_x = 2000 + gazebo_x * 20
         img_y = 2000 - gazebo_y * 20
@@ -398,89 +310,289 @@ class GazeboEnv:
         gazebo_x = (img_x - 2000) / 20.0
         gazebo_y = (2000 - img_y) / 20.0
         return gazebo_x, gazebo_y
+    
+    def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
+        """
+        檢查從 current 到 neighbor 的線段是否無障礙物。
+        
+        參數：
+        - png_image: 2D 地圖數組，障礙物區域值小於 safe_threshold。
+        - current: 當前點坐標 (x, y)。
+        - neighbor: 鄰居點坐標 (x, y)。
+        - safe_threshold: 無障礙的安全值閾值，默認為 230。
+        
+        返回：
+        - True: 無障礙。
+        - False: 存在障礙物。
+        """
+        current = np.array(current, dtype=np.int32)
+        neighbor = np.array(neighbor, dtype=np.int32)
 
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
+        # 使用 Bresenham 算法生成線段
+        rr, cc = line(current[1], current[0], neighbor[1], neighbor[0])
+
+        # 檢查是否越界
+        if np.any((rr < 0) | (rr >= png_image.shape[0]) | (cc < 0) | (cc >= png_image.shape[1])):
+            return False
+
+        # 檢查線段上的像素是否有障礙物
+        if np.any(png_image[rr, cc] < safe_threshold):
+            return False
+
+        return True
+    
+    def calculate_min_distance_to_obstacles(self, x, y, kd_tree):
         """
-        A* 算法對 50x50 的正方形內進行路徑優化
+        使用 KDTree 计算点 (x, y) 到障碍物的最小距离。
         """
-        # 使用 self.gazebo_to_image_coords 而不是 gazebo_to_image_coords
+        distance, _ = kd_tree.query((x, y))  # 查询最近邻距离
+        return distance
+
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, kd_tree, grid_size=50):
+        if not hasattr(self, 'g_scores'):
+            self.g_scores = {}  # 初始化 g_scores 属性，用于保存跨路径点的累积距离
+
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
-
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
+        # 初始化起点 g 值，如果不存在则设为 0
+        if (img_start_x, img_start_y) not in self.g_scores:
+            self.g_scores[(img_start_x, img_start_y)] = 0
+
+        # 获取当前参考点的索引
+        current_wp_index = self.current_waypoint_index
+
+        # 确保索引范围有效
+        if current_wp_index >= len(self.waypoint_distances):
+            rospy.logerr("Waypoint index out of range for h normalization.")
+            return start_point  # 如果发生错误，返回起点
+
+        # 分母从 self.waypoint_distances 获取当前参考点到目标参考点的距离
+        h_normalization_denominator = self.waypoint_distances[current_wp_index]
+
+        # 初始化
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
 
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
-            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
-                if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
-                    continue
+        # 獲取範圍內所有候選點
+        candidate_points = [
+            (xi, yi)
+            for xi in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2)
+            for yi in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2)
+            if 0 <= xi < png_image.shape[1] and 0 <= yi < png_image.shape[0]
+        ]
 
-                g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
-                h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
+        # 查詢所有候選點到障礙物的距離
+        if candidate_points:
+            distances = kd_tree.query(candidate_points)[0]  # 距離列表
+            max_obstacle_distance = np.max(distances)  # 最大距離
+        else:
+            max_obstacle_distance = 1  # 避免分母為 0
 
-                unwalkable_count = np.sum(png_image[max(0, y - grid_size // 2):min(y + grid_size // 2, png_image.shape[0]),
-                                                    max(0, x - grid_size // 2):min(x + grid_size // 2, png_image.shape[1])] < 250)
+        for x, y in candidate_points:
+            # 检查从上一个路径点到当前候选点是否通畅
+            if self.optimized_waypoints:
+                prev_point = self.optimized_waypoints[-1]
+                prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+                if not self.is_line_free(png_image, (prev_img_x, prev_img_y), (x, y)):
+                    continue  # 如果有障碍物，跳过该点
 
-                f = g + h + unwalkable_count * 2
+            # 计算代价地图权重
+            costmap_cost = self.cost_map[y, x]
 
-                if f < best_f_score:
-                    best_f_score = f
-                    best_point = (x, y)
+            # 当前点的移动距离计算基于车辆的实际路径点
+            if len(self.optimized_waypoints) > 0:
+                last_waypoint = self.optimized_waypoints[-1]
+                last_img_x, last_img_y = self.gazebo_to_image_coords(*last_waypoint)
+                step_distance = np.sqrt((x - last_img_x) ** 2 + (y - last_img_y) ** 2)
+                g = self.g_scores.get((last_img_x, last_img_y), 0) + step_distance
+            else:
+                step_distance = 0
+                g = self.g_scores[(img_start_x, img_start_y)]
 
-        # 使用 self.image_to_gazebo_coords 而不是 image_to_gazebo_coords
+            self.g_scores[(x, y)] = g
+
+            # 正規化 g 值
+            g_normalized = (g * 0.05) / self.total_path_distance
+
+            # 当前点到目标点的 h 值（启发式）
+            h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
+
+            # 正規化 h 值，使用當前點到參考點的距離作為分母
+            h_normalized = (h * 0.05) / h_normalization_denominator if h_normalization_denominator > 0 else h
+
+            # 平滑性代价调整
+            if len(self.optimized_waypoints) >= 2:
+                prev_prev_point = self.optimized_waypoints[-2]
+                prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
+                prev_point = self.optimized_waypoints[-1]
+                prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+
+                # 差分计算
+                delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
+                delta_xi1 = (x - prev_img_x, y - prev_img_y)
+                smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
+
+                # 正規化平滑性代價
+                max_smoothness_cost = grid_size ** 2  # 假设最大位移为 grid_size 的平方和
+                smoothness_cost_normalized = smoothness_cost / max_smoothness_cost if max_smoothness_cost > 0 else 0
+            else:
+                smoothness_cost_normalized = 0
+
+            # 基于 KDTree 计算最小障碍物距离
+            obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+
+            # 正規化距离代价
+            distance_penalty_normalized = -obstacle_distance / max_obstacle_distance if max_obstacle_distance > 0 else 0
+
+            # 计算总的代价 f
+            f = ( g_normalized * 1 + h_normalized * 1) * 0.34 + smoothness_cost_normalized * 1 * 0.33 + distance_penalty_normalized * 1 * 0.33 + costmap_cost
+
+            if f < best_f_score:
+                best_f_score = f
+                best_point = (x, y)
+
         optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
-
         return optimized_gazebo_x, optimized_gazebo_y
 
-
     def optimize_waypoints_with_a_star(self):
-        """
-        使用 A* 算法來優化路徑點，但僅在尚未計算過時執行
-        """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Using previously calculated optimized waypoints.")
             self.waypoints = self.optimized_waypoints  # 使用已計算的優化路徑
             return
 
         rospy.loginfo("Calculating optimized waypoints for the first time using A*.")
+
+        # 使用 KDTree 构建障碍物点索引（仅构建一次）
+        obstacle_points = [
+            (x, y) for y in range(self.slam_map.shape[0]) for x in range(self.slam_map.shape[1])
+            if self.slam_map[y, x] < 250
+        ]
+        if not obstacle_points:
+            rospy.logwarn("No obstacles detected in map.")
+            obstacle_points = [(0, 0)]  # 默认无障碍物情况
+        kd_tree = KDTree(obstacle_points)
+
         optimized_waypoints = []
         for i in range(len(self.waypoints) - 1):
+            # 使用局部變量 `i`，不影響 `self.current_waypoint_index`
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
-            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
+            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point, kd_tree)
             optimized_waypoints.append(optimized_point)
 
         # 最後一個終點加入到優化後的路徑點列表中
         optimized_waypoints.append(self.waypoints[-1])
-        
+
+        # 更新優化後的路徑點
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = optimized_waypoints
-        print(self.waypoints)
         self.optimized_waypoints_calculated = True  # 設定標記，表示已計算過
 
+        save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path.png'
+        self.visualize_complete_path(self.optimized_waypoints, save_path=save_path)
+        rospy.loginfo(f"Global path optimization complete. Visualization saved to {save_path}.")
+    
+    def visualize_original_path(self, save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/original_path.png'):
+        """
+        可视化原始的参考路径点，并保存为图片。
+        """
+        if not hasattr(self, 'slam_map'):
+            raise ValueError("SLAM map not loaded.")
 
-    def bezier_curve(self, waypoints, n_points=100):
-        waypoints = np.array(waypoints)
-        n = len(waypoints) - 1
+        # 转换地图为灰度图
+        map_img = self.slam_map.copy()
+        map_img[map_img < 250] = 0  # 障碍物区域
+        map_img[map_img >= 250] = 255  # 可通行区域
 
-        def bernstein_poly(i, n, t):
-            return comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
+        # 转换路径点到图像坐标
+        img_points = [self.gazebo_to_image_coords(p[0], p[1]) for p in self.generate_waypoints()]  # 使用原始路径点
 
-        t = np.linspace(0.0, 1.0, n_points)
-        curve = np.zeros((n_points, 2))
+        # 绘制地图
+        plt.figure(figsize=(10, 10))
+        plt.imshow(map_img, cmap='gray', origin='upper')
 
-        for i in range(n + 1):
-            curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
+        # 绘制路径点为单独的点
+        for point in img_points:
+            if 0 <= point[0] < map_img.shape[1] and 0 <= point[1] < map_img.shape[0]:
+                plt.scatter(point[0], point[1], color='orange', s=5)  # 单独的点，大小为5
 
-        return curve
+        # 标注起点和终点
+        img_start = self.gazebo_to_image_coords(*self.generate_waypoints()[0])
+        img_goal = self.gazebo_to_image_coords(*self.generate_waypoints()[-1])
+        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
+        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
 
-    def collision_callback(self, data):
-        if len(data.states) > 0:
-            self.collision_detected = True
-            rospy.loginfo("Collision detected!")
-        else:
-            self.collision_detected = False
+        # 设置绘图范围
+        plt.xlim(0, map_img.shape[1])
+        plt.ylim(map_img.shape[0], 0)  # 注意：图像坐标 y 轴是倒置的
+
+        # 添加图例并保存图片
+        plt.legend()
+        plt.title('Original Path Points Visualization')
+        plt.savefig(save_path)
+        plt.close()
+        rospy.loginfo(f"Original path visualization saved to {save_path}")
+    
+    def visualize_complete_path(self, waypoints, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
+        """
+        可视化路径点和当前位置，并在 costmap 上显示
+        """
+        if not hasattr(self, 'slam_map') or not hasattr(self, 'cost_map'):
+            raise ValueError("SLAM map or cost map not loaded.")
+
+        # 創建一個 RGB 圖像來顯示 cost map
+        cost_map_rgb = np.zeros((self.cost_map.shape[0], self.cost_map.shape[1], 3), dtype=np.uint8)
+        
+        # 將不同代價值映射到不同顏色
+        cost_map_rgb[self.cost_map == 0] = [255, 255, 255]      # 空白區域為白色
+        cost_map_rgb[self.cost_map == 100] = [200, 200, 255]    # 外層膨脹區為淺藍色
+        cost_map_rgb[self.cost_map == 190] = [150, 150, 255]    # 內層膨脹區為中藍色
+        cost_map_rgb[self.cost_map == 254] = [100, 100, 100]    # 障礙物為灰色
+
+        # 獲取當前機器人位置
+        robot_x, robot_y, _ = self.get_robot_position()
+        robot_img_x, robot_img_y = self.gazebo_to_image_coords(robot_x, robot_y)
+
+        # 轉換路徑點到圖像坐標
+        img_points = [self.gazebo_to_image_coords(p[0], p[1]) for p in waypoints]
+
+        # 創建圖像
+        plt.figure(figsize=(12, 12))
+        plt.imshow(cost_map_rgb)
+
+        # 繪製所有路徑點
+        for i, point in enumerate(img_points):
+            if 0 <= point[0] < cost_map_rgb.shape[1] and 0 <= point[1] < cost_map_rgb.shape[0]:
+                if i == self.current_waypoint_index:
+                    # 當前目標點用黃色標記
+                    plt.scatter(point[0], point[1], color='yellow', s=100, marker='*', label='Current Target')
+                else:
+                    # 其他路徑點用綠色標記
+                    plt.scatter(point[0], point[1], color='green', s=20)
+
+        # 標記起點和終點
+        img_start = self.gazebo_to_image_coords(*waypoints[0])
+        img_goal = self.gazebo_to_image_coords(*waypoints[-1])
+        plt.scatter(img_start[0], img_start[1], color='blue', s=100, marker='^', label='Start')
+        plt.scatter(img_goal[0], img_goal[1], color='red', s=100, marker='v', label='Goal')
+
+        # 標記當前機器人位置
+        plt.scatter(robot_img_x, robot_img_y, color='purple', s=150, marker='o', label='Robot')
+
+        # 添加圖例和標題
+        plt.legend(fontsize=12)
+        plt.title('Path Visualization with Cost Map', fontsize=14)
+        
+        # 設置軸的範圍
+        plt.xlim(0, cost_map_rgb.shape[1])
+        plt.ylim(cost_map_rgb.shape[0], 0)  # 注意：圖像坐標 y 軸是倒置的
+
+        # 保存圖片
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        rospy.loginfo(f"Path visualization with cost map saved to {save_path}")
 
     def generate_imu_data(self):
         imu_data = Imu()
@@ -504,42 +616,11 @@ class GazeboEnv:
 
         return imu_data
 
-    def is_valid_data(self, data):
-        for point in pc2.read_points(data, field_names=("x", "y", "z"), skip_nans=True):
-            if point[0] != 0.0 or point[1] != 0.0 or point[2] != 0.0:
-                return True
-        return False
-
-    def transform_point(self, point, from_frame, to_frame):
-        try:
-            now = rospy.Time.now()
-            self.listener.waitForTransform(to_frame, from_frame, now, rospy.Duration(1.0))
-            
-            point_stamped = PointStamped()
-            point_stamped.header.frame_id = from_frame
-            point_stamped.header.stamp = now
-            point_stamped.point.x = point[0]
-            point_stamped.point.y = point[1]
-            point_stamped.point.z = point[2]
-            
-            point_transformed = self.listener.transformPoint(to_frame, point_stamped)
-            return [point_transformed.point.x, point_transformed.point.y, point_transformed.point.z]
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            rospy.logerr(f"Transform failed: {e}")
-            return [point[0], point[1], point[2]]
-
-    def convert_open3d_to_ros(self, cloud):
-        header = rospy.Header()
-        header.stamp = rospy.Time.now()
-        header.frame_id = 'velodyne'
-        points = np.asarray(cloud.points)
-        return pc2.create_cloud_xyz32(header, points)
-
     def generate_occupancy_grid(self, robot_x, robot_y, linear_speed, steer_angle, grid_size=0.05, map_size=100):
         # 将机器人的坐标转换为地图上的像素坐标
 
         linear_speed = np.clip(linear_speed, -2.0, 2.0)
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)
+        steer_angle = np.clip(steer_angle, -0.5, 0.5)
 
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
 
@@ -567,12 +648,11 @@ class GazeboEnv:
         occupancy_grid[1, :, :] = (linear_speed + 2.0)/4
 
         # 第三层：归一化角度到 [0, 1]
-        occupancy_grid[2, :, :] = (steer_angle + 0.6)/1.2 
+        occupancy_grid[2, :, :] = (steer_angle + 0.5)/1.0
 
         if np.isnan(occupancy_grid).any() or np.isinf(occupancy_grid).any():
             raise ValueError("NaN or Inf detected in occupancy_grid!")
         return occupancy_grid
-
 
     def step(self, action, obstacles):
         reward = 0
@@ -581,7 +661,7 @@ class GazeboEnv:
         # 确保 action 是一维数组
         action = np.squeeze(action)
         linear_speed = np.clip(action[0], -2.0, 2.0)
-        steer_angle = np.clip(action[1], -0.6, 0.6)
+        steer_angle = np.clip(action[1], -0.5, 0.5)
         print("linear speed = ", linear_speed, " steer angle = ", steer_angle)
 
         # 更新状态
@@ -597,7 +677,7 @@ class GazeboEnv:
 
         if distance_to_goal < 0.5:  # 设定阈值为0.5米，可根据需要调整
             print('Robot has reached the goal!')
-            reward += 10 # 给一个大的正向奖励
+            reward += 20.0 # 给一个大的正向奖励
             self.reset()
             return self.state, reward, True, {}  # 重置环境
 
@@ -605,7 +685,7 @@ class GazeboEnv:
             current_wp = self.waypoints[self.current_waypoint_index]
             distance_to_wp = np.linalg.norm([robot_x - current_wp[0], robot_y - current_wp[1]])
             if distance_to_wp < 0.5:  # 假設通過 waypoint 的距離閾值為 0.5
-                reward += 2  # 通過 waypoint 獎勵
+                reward += 1.0  # 通過 waypoint 獎勵
 
         # 更新机器人位置
         if self.previous_robot_position is not None:
@@ -614,7 +694,7 @@ class GazeboEnv:
                 robot_y - self.previous_robot_position[1]
             ])
             reward += distance_moved*5  # 根据移动距离奖励
-            print("reward by distance_moved +", distance_moved)
+            # print("reward by distance_moved +", distance_moved)
         else:
             distance_moved = 0
 
@@ -628,41 +708,21 @@ class GazeboEnv:
         use_deep_rl_control = any(
             self.waypoint_failures.get(i, 0) > 1 for i in failure_range
         )
-
-        collision = detect_collision(robot_x, robot_y, robot_yaw, obstacles)
-        if not use_deep_rl_control:
-            if collision:
-                self.waypoint_failures[self.current_waypoint_index] += 1
-                print('touch the obstacles')
-                reward -= 10.0
-                self.reset()
-                return self.state, reward, True, {}
         
         # 处理无进展的情况
         if distance_moved < 0.05:
             self.no_progress_steps += 1
+            reward -= 0.3
             if self.no_progress_steps >= self.max_no_progress_steps:
-                if use_deep_rl_control:
-                    print('failure at point', self.current_waypoint_index)
-                    rospy.loginfo("No progress detected, resetting environment.")
-                    reward -= 10.0
-                    self.reset()
-                    return self.state, reward, True, {}
-                else:
-                    self.waypoint_failures[self.current_waypoint_index] += 1
-                    print('failure at point', self.current_waypoint_index)
-                    rospy.loginfo("No progress detected, resetting environment.")
-                    reward -= 10.0
-                    self.reset()
-                    return self.state, reward, True, {}
+                self.waypoint_failures[self.current_waypoint_index] += 1
+                print('failure at point', self.current_waypoint_index)
+                rospy.loginfo("No progress detected, resetting environment.")
+                reward -= 10.0
+                self.reset()
+                return self.state, reward, True, {}
         else:
             self.no_progress_steps = 0
         
-        if self.collision_detected:
-            rospy.loginfo('collision detectd! resetting')
-            reward -= 10.0
-            self.reset()
-            return self.state, reward, True, {}
         # 发布控制命令
         twist = Twist()
         twist.linear.x = linear_speed
@@ -675,10 +735,6 @@ class GazeboEnv:
 
         rospy.sleep(0.1)
 
-        if isinstance(self.state, np.ndarray):
-            self.state = torch.tensor(self.state, dtype=torch.float32).unsqueeze(0).to(device)  # 增加 batch 维度
-        elif self.state.dim() != 4:
-            self.state = self.state.unsqueeze(0)  # 增加 batch 维度
         reward, _ = self.calculate_reward(robot_x, robot_y, reward, self.state)
         print('reward = ',reward)
         return self.state, reward, self.done, {}
@@ -693,8 +749,8 @@ class GazeboEnv:
         quaternion = quaternion_from_euler(0.0, 0.0, yaw)
         state_msg = ModelState()
         state_msg.model_name = 'my_robot'
-        state_msg.pose.position.x = 0.2206
-        state_msg.pose.position.y = 0.1208
+        state_msg.pose.position.x = -6.4981
+        state_msg.pose.position.y = -1.0627
         state_msg.pose.position.z = 2.2
         state_msg.pose.orientation.x = quaternion[0]
         state_msg.pose.orientation.y = quaternion[1]
@@ -735,13 +791,6 @@ class GazeboEnv:
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
         self.previous_distance_to_goal = None
-        self.collision_detected = False
-
-        # Ensure the state is 4D tensor
-        if isinstance(self.state, np.ndarray):
-            self.state = torch.tensor(self.state, dtype=torch.float32).unsqueeze(0).to(device)
-        elif self.state.dim() != 4:
-            self.state = self.state.unsqueeze(0)
         return self.state
 
 
@@ -749,8 +798,6 @@ class GazeboEnv:
         done = False
         # 將機器人的座標轉換為地圖上的坐標
         
-        if isinstance(state, torch.Tensor):
-            state = state.cpu().numpy()
         if state.ndim == 4:
             # 对于 4 维情况，取第一个批次数据中的第一层
             occupancy_grid = state[0, 0]
@@ -760,8 +807,7 @@ class GazeboEnv:
 
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
         obstacle_count = np.sum(occupancy_grid <= 190/255.0)  # 假設state[0]為佔據網格通道
-        print('obstacle_count',obstacle_count)
-        reward += 3 - obstacle_count*3/100.0
+        reward += 5 - obstacle_count*3/100.0
 
         return reward, done
 
@@ -790,10 +836,10 @@ class GazeboEnv:
 
         # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        lookahead_distance = 2.0 + 0.5 * linear_speed  # 根據速度調整前視距離
+        lookahead_distance = 1.2 + 0.5 * linear_speed  # 根據速度調整前視距離
 
         # 定義角度範圍，以當前車輛的yaw為中心
-        angle_range = np.deg2rad(40)  # ±40度的範圍
+        angle_range = np.deg2rad(30)  # ±30度的範圍
         closest_index = None
         min_distance = float('inf')
 
@@ -837,23 +883,22 @@ class GazeboEnv:
 
         # 根據角度誤差調整速度
         if np.abs(yaw_error) > 0.3:
-            linear_speed = 0.5
+            linear_speed = 1.6
         elif np.abs(yaw_error) > 0.1:
-            linear_speed = 1.0
+            linear_speed = 1.8
         else:
-            linear_speed = 3
+            linear_speed = 2.0
 
         # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = yaw_error - previous_yaw_error
         steer_angle = kp * yaw_error + kd * current_yaw_error_rate
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)
+        steer_angle = np.clip(steer_angle, -0.5, 0.5)
 
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
-
 
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
@@ -878,140 +923,14 @@ class GazeboEnv:
             kd = 0.4
         return kp, kd
 
-class ActorCritic(nn.Module):
-    def __init__(self, observation_space, action_space):
-        super(ActorCritic, self).__init__()
-        # 初始化网络层
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
-        self.bn3 = nn.BatchNorm2d(128)
-
-        self.fc1 = nn.Linear(self._get_conv_output_size(observation_space), 256)
-        self.fc2 = nn.Linear(256, 128)
-
-        self.actor = nn.Linear(128, action_space)
-        self.critic = nn.Linear(128, 1)
-        self.actor_log_std = nn.Parameter(torch.ones(1,action_space)* -1.0)
-
-        # 初始化权重
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-
-    def _get_conv_output_size(self, shape):
-        x = torch.zeros(1, *shape)
-        x = torch.relu(self.bn1(self.conv1(x)))
-        x = torch.relu(self.bn2(self.conv2(x)))
-        x = torch.relu(self.bn3(self.conv3(x)))
-        x = x.view(1, -1)
-        return x.size(1)
-
-    def forward(self, x):
-        print("Input shape to forward:", x.shape)
-
-    # 检查输入是否包含异常值
-        if torch.isnan(x).any():
-            print("Error: NaN detected in input")
-            raise ValueError("NaN detected in input")
-
-        # 正常 forward 逻辑
-        x = torch.relu(self.bn1(self.conv1(x)))
-        x = torch.relu(self.bn2(self.conv2(x)))
-        x = torch.relu(self.bn3(self.conv3(x)))
-        x = x.view(x.size(0), -1)
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-
-        action_mean = self.actor(x)
-        action_log_std = self.actor_log_std.expand_as(action_mean)
-        action_log_std = torch.clamp(action_log_std, min=-3, max=1)
-        action_std = torch.exp(action_log_std)
-        value = self.critic(x)
-
-        if torch.isnan(action_mean).any() or torch.isnan(action_std).any():
-            raise ValueError("NaN detected in action_mean or action_std")
-        if torch.isnan(value).any():
-            raise ValueError("NaN detected in value")
-
-        return action_mean, action_std, value
-
-
-
-    def act(self, state):
-        # 確保 state 是 tensor，如果是 numpy，轉換為 tensor
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float32).to(device)
-
-        # 去除多餘維度直到 <= 4
-        while state.dim() > 4:
-            state = state.squeeze(0)
-
-        # 添加缺少的維度直到 = 4
-        while state.dim() < 4:
-            state = state.unsqueeze(0)
-
-        # 最終確認 state 是 4D
-        if state.dim() != 4:
-            raise ValueError(f"Expected state to be 4D, but got {state.dim()}D")
-
-        action_mean, action_std, _ = self(state)
-
-        noise = torch.randn_like(action_std)*0.01
-        noisy_action = action_mean + action_std*noise
-
-        noisy_action = torch.tanh(noisy_action)
-        max_action = torch.tensor([2.0, 0.6], device=noisy_action.device)
-        min_action = torch.tensor([-2.0, -0.6], device=noisy_action.device)
-        action = min_action + (noisy_action + 1) * (max_action - min_action) / 2
-
-        if torch.isnan(action).any():
-            raise ValueError("Nan detected in action output")
-        return action.detach()
-
-    def evaluate(self, state, action):
-        action_mean, action_std, value = self(state)
-
-        # 添加檢查輸出的代碼
-        if torch.isnan(action_mean).any() or torch.isnan(action_std).any():
-            print("Error: NaN in action_mean or action_std")
-            print("action_mean:", action_mean)
-            print("action_std:", action_std)
-            raise ValueError("NaN detected in model output")
-
-        if torch.any(action_std <= 0):
-            print("Error: Invalid action_std <= 0")
-            print("action_std:", action_std)
-            raise ValueError("Invalid action_std detected")
-
-        dist = torch.distributions.Normal(action_mean, action_std)
-        action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
-        dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
-        return action_log_probs, value, dist_entropy
-
 class DWA:
     def __init__(self, goal):
         self.max_speed = 2
-        self.max_yaw_rate = 0.6
-        self.dt = 0.2
-        self.predict_time = 2.0
+        self.max_yaw_rate = 0.5
+        self.dt = 0.1
+        self.predict_time = 3.0
         self.goal = goal
-        self.robot_radius = 0.6
+        self.robot_radius = 0.3
 
     def calc_dynamic_window(self, state):
         # 當前速度限制
@@ -1049,7 +968,7 @@ class DWA:
             for ox, oy in obstacles:
                 dist = np.sqrt((ox - tx) ** 2 + (oy - ty) ** 2)
                 if dist < self.robot_radius:
-                    return goal_score, -100, 0.0  # 如果发生碰撞，直接返回最低分
+                    return goal_score, -100.0, 0.0  # 如果发生碰撞，直接返回最低分
                 clearance_score = min(clearance_score, dist)
 
         # 速度分数
@@ -1063,7 +982,7 @@ class DWA:
         dw = self.calc_dynamic_window(state)  # 速度 角度限制
         # 遍歷動態窗口中的所有控制
         best_trajectory = None
-        best_score = -100
+        best_score = -100.0
         best_control = [0.0, 0.0]
         # print("Dynamic Window", dw)
         for v in np.arange(dw[0], dw[1], 0.2):  # 線速度範圍
@@ -1074,119 +993,15 @@ class DWA:
                 trajectory = self.calc_trajectory(state, control)
                 # 計算評分函數
                 goal_score, clearance_score, speed_score = self.calc_score(trajectory, obstacles)
-                total_score = goal_score * 0.55 + clearance_score * 0.35  + speed_score * 0.1
+                total_score = goal_score * 0.5 + clearance_score * 0.45  + speed_score * 0.05
 
                 # 找到最佳控制
                 if total_score > best_score:
                     best_score = total_score
                     best_trajectory = trajectory
                     best_control = control
-        # formatted_trajectory = [(point[0], point[1]) for point in best_trajectory]
-        # print(f"Best trajectory: {formatted_trajectory}")
-        # print("goal score = ", goal_score, "safety score = ", clearance_score, "speed score = ", speed_score)
         print(f"v: {v}, omega: {omega}, goal_score: {goal_score}, clearance_score: {clearance_score}, speed_score: {speed_score}")
         return best_control, best_trajectory
-
-def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler, batch_size):
-    print(f"[DEBUG] Starting PPO update with batch size: {batch_size}")
-
-    # 檢查記憶庫是否有足夠樣本
-    valid_samples = len([x for x in memory.memory if x is not None])
-    if valid_samples < batch_size:
-        print(f"[PPO Update] Skipping update. Not enough valid samples in memory. Current memory size: {valid_samples}")
-        return
-
-    print(f"[PPO Update] Starting PPO update with {ppo_epochs} epochs and batch size {batch_size}.")
-    batch_size = min(batch_size, valid_samples)
-
-    for epoch in range(ppo_epochs):
-        # 動態調整學習率
-        adjusted_lr = LEARNING_RATE * (1 / (1 + epoch * 0.001))
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = adjusted_lr
-
-        # 抽取樣本
-        try:
-            state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(batch_size)
-        except ValueError as e:
-            print(f"[PPO Update] Sampling failed: {str(e)}")
-            return
-
-        print(f"[DEBUG] Sampled state_batch shape: {state_batch.shape}, next_state_batch shape: {next_state_batch.shape}")
-        
-        # 調整維度
-        state_batch, next_state_batch = _adjust_dimensions(state_batch, next_state_batch)
-
-        print(f"[DEBUG] State batch after adjustment: {state_batch.shape}, Next state batch after adjustment: {next_state_batch.shape}")
-
-        # 標準化和裁剪 reward
-        reward_batch = (reward_batch - reward_batch.mean()) / (reward_batch.std() + 1e-5)
-        reward_batch = torch.clamp(reward_batch, -1.0, 1.0)
-
-        # 檢查是否有 NaN
-        if torch.isnan(state_batch).any() or torch.isnan(action_batch).any():
-            raise ValueError("[PPO Update] NaN detected in sampled state or action batch.")
-
-        # 計算舊 log_probs 和狀態價值
-        with torch.no_grad():
-            old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
-            _, _, next_state_values = model(next_state_batch)
-            _, _, state_values = model(state_batch)
-
-        if torch.isnan(old_log_probs).any() or torch.isnan(next_state_values).any() or torch.isnan(state_values).any():
-            raise ValueError("[PPO Update] NaN detected in model evaluation outputs.")
-
-        # 計算 target values 和優勢 (advantages)
-        target_values = reward_batch + (1 - done_batch) * GAMMA * next_state_values
-        advantages = target_values - state_values
-
-        # 標準化 advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
-        advantages = torch.clamp(advantages, -10, 10)
-
-        if torch.isnan(advantages).any():
-            raise ValueError("[PPO Update] NaN detected in advantages.")
-
-        # 更新策略與價值網絡
-        for _ in range(PPO_EPOCHS):
-            with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type="cuda"):  # 混合精度
-                log_probs, state_values, dist_entropy = model.evaluate(state_batch, action_batch)
-                ratio = (log_probs - old_log_probs).exp()
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
-
-                # 計算損失
-                actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = nn.MSELoss()(state_values, target_values)
-                entropy_loss = -0.1 * dist_entropy.mean()  # 熵正則項
-
-                loss = actor_loss + 0.5 * critic_loss + entropy_loss
-                print(f"[PPO Update] Losses - Actor: {actor_loss.item()}, Critic: {critic_loss.item()}, Entropy: {entropy_loss.item()}")
-                wandb.log({
-                    # PPO 更新相關
-                    "actor_loss": actor_loss.item(),
-                    "critic_loss": critic_loss.item(),
-                    "entropy_loss": entropy_loss.item(),
-                    "policy_gradient_magnitude": torch.norm(actor_loss.grad).item() if actor_loss.grad is not None else 0,
-                    "value_prediction_error": critic_loss.item(),
-                    "advantage_mean": advantages.mean().item(),
-                    "advantage_std": advantages.std().item(),
-                })
-
-            if torch.isnan(loss).any():
-                raise ValueError("[PPO Update] NaN detected in loss.")
-
-            # 反向傳播與更新
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-        # 更新優先級
-        priorities = (advantages.abs() + 1e-5).detach().cpu().numpy()
-        memory.update_priorities(indices, priorities)
-        memory.clear()
-        print(f"[PPO Update] Epoch {epoch} completed successfully.")
 
 def calculate_bounding_box(robot_x, robot_y, robot_yaw):
 
@@ -1225,178 +1040,51 @@ def is_point_in_polygon(point, polygon):
             inside = not inside
     return inside
 
-def detect_collision(robot_x, robot_y, robot_yaw, obstacles):
-    # 计算边界框
-    bounding_box = calculate_bounding_box(robot_x, robot_y, robot_yaw,)
+def select_action_with_exploration(env, state, dwa=None, obstacles=None):
+    if dwa is None or obstacles is None:
+        raise ValueError("DWA controller or obstacles is not provided")
+    print("[Exploration] Using DWA for action generation.")
 
-    # 遍历障碍物
-    for obstacle in obstacles:
-        # 检查是否在边界内
-        if is_point_in_polygon(obstacle, bounding_box):
-            return True
-    return False
+    robot_x, robot_y, robot_yaw = env.get_robot_position()
+    current_speed = env.last_twist.linear.x
+    current_omega = env.last_twist.angular.z
 
-class MapVisualizer:
-    def __init__(self, slam_map_path, figsize=(15, 6)):
-        # 載入並處理SLAM地圖
-        with open(slam_map_path, 'r') as file:
-            map_metadata = yaml.safe_load(file)
-            self.map_origin = map_metadata['origin']
-            self.map_resolution = map_metadata['resolution']
-            png_path = map_metadata['image'].replace(".pgm", ".png")
-            
-        # 載入PNG地圖
-        self.png_map = cv2.imread('/home/ash/Downloads/0822-1floor/my_map0924.png', cv2.IMREAD_GRAYSCALE)
-        
-        # 創建障礙物地圖（二值化黑白版本）
-        self.obstacle_map = (self.png_map < 190).astype(np.uint8) * 255
-        
-        # 初始化matplotlib圖形
-        self.fig, (self.ax1, self.ax2) = plt.subplots(1, 2, figsize=figsize)
-        self.robot_plot1 = None
-        self.robot_plot2 = None
-        self.trajectory1 = []
-        self.trajectory2 = []
-        
-        # 設置圖形顯示
-        self.ax1.imshow(self.png_map, cmap='gray')
-        self.ax1.set_title('PNG地圖視圖')
-        self.ax2.imshow(self.obstacle_map, cmap='gray')
-        self.ax2.set_title('障礙物地圖視圖')
-        
-        plt.ion()  # 啟用互動模式
-        
-    def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
-        # Gazebo座標轉換為圖像座標
-        img_x = 2000 + gazebo_x * 20
-        img_y = 2000 - gazebo_y * 20
-        return int(img_x), int(img_y)
-    
-    def update_position(self, gazebo_x, gazebo_y):
-        # 將Gazebo座標轉換為圖像座標
-        img_x, img_y = self.gazebo_to_image_coords(gazebo_x, gazebo_y)
-        
-        # 儲存軌跡點
-        self.trajectory1.append((img_x, img_y))
-        self.trajectory2.append((img_x, img_y))
-        
-        # 更新機器人在兩個地圖上的位置
-        if self.robot_plot1 is not None:
-            self.robot_plot1.remove()
-        if self.robot_plot2 is not None:
-            self.robot_plot2.remove()
-            
-        # 繪製軌跡
-        trajectory_x1, trajectory_y1 = zip(*self.trajectory1)
-        trajectory_x2, trajectory_y2 = zip(*self.trajectory2)
-        
-        self.ax1.plot(trajectory_x1, trajectory_y1, 'r-', linewidth=1, alpha=0.5)
-        self.ax2.plot(trajectory_x2, trajectory_y2, 'r-', linewidth=1, alpha=0.5)
-        
-        # 繪製當前位置
-        self.robot_plot1 = self.ax1.plot(img_x, img_y, 'ro', markersize=10)[0]
-        self.robot_plot2 = self.ax2.plot(img_x, img_y, 'ro', markersize=10)[0]
-        
-        # 添加位置文字說明
-        self.ax1.set_title(f'PNG地圖視圖 (x:{gazebo_x:.2f}, y:{gazebo_y:.2f})')
-        self.ax2.set_title(f'障礙物地圖視圖 (x:{gazebo_x:.2f}, y:{gazebo_y:.2f})')
-        
-        plt.draw()
-        plt.pause(0.01)
-    
-    def clear_trajectory(self):
-        # 清除軌跡並重置顯示
-        self.trajectory1 = []
-        self.trajectory2 = []
-        self.ax1.cla()
-        self.ax2.cla()
-        self.ax1.imshow(self.png_map, cmap='gray')
-        self.ax2.imshow(self.obstacle_map, cmap='gray')
-        plt.draw()
-
-def _adjust_dimensions(state_batch, next_state_batch):
-    print(f"[DEBUG] Before adjustment - State shape: {state_batch.shape}, Next state shape: {next_state_batch.shape}")
-    
-    # 如果多了一個額外的維度，移除它
-    if state_batch.dim() == 5 and state_batch.shape[1] == 1:
-        state_batch = state_batch.squeeze(1)  # 移除第二個維度
-    if next_state_batch.dim() == 5 and next_state_batch.shape[1] == 1:
-        next_state_batch = next_state_batch.squeeze(1)
-
-    # 再次檢查形狀
-    if state_batch.dim() != 4 or next_state_batch.dim() != 4:
-        raise ValueError(f"[PPO Update] Invalid batch shapes: state_batch: {state_batch.shape}, next_state_batch: {next_state_batch.shape}")
-
-    print(f"[DEBUG] After adjustment - State shape: {state_batch.shape}, Next state shape: {next_state_batch.shape}")
-    return state_batch, next_state_batch
-
-def _check_for_nan(tensors, error_message):
-    for tensor in tensors:
-        if tensor is not None and torch.isnan(tensor).any():
-            raise ValueError(error_message)
-        
-def _check_for_invalid_values(tensor, name):
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-        raise ValueError(f"[PPO Update] {name} contains invalid values (NaN or Inf).")
-
-def select_action_with_exploration(env, state, model, epsilon=1.0, dwa=None, obstacles=None):
-    if random.random() < epsilon:
-        if dwa is None or obstacles is None:
-            raise ValueError("DWA controller or obstacles is not provided")
-        print("[Exploration] Using DWA for action generation. ")
-
-        robot_x, robot_y, robot_yaw = env.get_robot_position()
-        current_speed = env.last_twist.linear.x
-        current_omega = env.last_twist.angular.z
-
-        state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
-        action, _ = dwa.plan(state, obstacles)  
-        action = torch.tensor(action, dtype=torch.float32).to(device)  # 確保格式正確
-    else:
-        # 使用模型的動作
-        print('action by RL')
-        action = model.act(state)
+    print('robot x = ', robot_x, 'robot_y = ', robot_y)
+    state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
+    action, _ = dwa.plan(state, obstacles)  
+    # action = torch.tensor(action, dtype=torch.float32).to(device)
     return action
+
+def save_movement_log_to_csv(movement_log, filename= f"/home/chihsun/catkin_ws/src/my_robot_control/new_waypoint/move_log{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"):
+    with open(filename,mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['x', 'y', 'yaw'])
+        for log in movement_log:
+            writer.writerow(log)
+    print(f"Movement log saved to {filename}")
+
+def grid_filter(obstacles, grid_size=0.5):
+    obstacles = np.array(obstacles)
+    # 按照 grid_size 取整
+    grid_indices = (obstacles // grid_size).astype(int)
+    # 找到唯一的网格
+    unique_indices = np.unique(grid_indices, axis=0)
+    # 返回网格中心点
+    filtered_points = unique_indices * grid_size + grid_size / 2
+    return filtered_points
 
 def main():
     env = GazeboEnv(None)
     dwa = DWA(goal=env.waypoints[env.current_waypoint_index + 3])
-    model = ActorCritic(env.observation_space, env.action_space).to(device)
-    env.model = model
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scaler = GradScaler('cuda')
-    memory = PrioritizedMemory(MEMORY_SIZE)
 
-    model_path = "/home/ash/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
-    best_model_path = "/home/ash/catkin_ws/src/my_robot_control/scripts/best_model.pth"
-
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        print("Loaded existing model.")
-    else:
-        print("Created new model.")
-
-    wandb.init(project="my_robot_workspace")
-    wandb.config = {
-        "learning_rate": LEARNING_RATE,
-        "batch_size": BATCH_SIZE,
-        "gamma": GAMMA,
-        "ppo_epochs": PPO_EPOCHS,
-        "clip_param": CLIP_PARAM,
-        "memory_size": MEMORY_SIZE,
-        "prediction_horizon": PREDICTION_HORIZON,
-        "control_horizon": CONTROL_HORIZON,
-    }
+    env.visualize_original_path()
 
     num_episodes = 1000000
-    best_test_reward = -np.inf
-    movement_log = []  # 存储记录的列表
-    last_recorded_position = None  # 记录上一次记录的位置
+    # best_test_reward = -np.inf
+    
+    last_recorded_position = None
 
-    # 在main()函數中，環境初始化後添加：
-    visualizer = MapVisualizer('/home/ash/Downloads/0822-1floor/my_map0924.yaml')
-
-    # init the obstacle information
+    # Initialize obstacles
     static_obstacles = []
     for y in range(env.slam_map.shape[0]):
         for x in range(env.slam_map.shape[1]):
@@ -1405,73 +1093,55 @@ def main():
                 static_obstacles.append((ox, oy))
  
     for e in range(num_episodes):
+        movement_log = []
         if not env.optimized_waypoints_calculated:
             env.optimize_waypoints_with_a_star()
 
-        state = env.reset()   # 更新车子到初始点
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=torch.float32)
-        state = state.clone().detach().unsqueeze(0).to(device)
+        state = env.reset()
 
         total_reward = 0
         start_time = time.time()
 
-        for time_step in range(1500):  # there will be no greater than 1500 actions per episode=
-
+        for time_step in range(1500):
             robot_x, robot_y, robot_yaw = env.get_robot_position()
-            visualizer.update_position(robot_x, robot_y)
 
-            # 检查是否需要记录当前位置
             if last_recorded_position is None or np.linalg.norm(
                 [robot_x - last_recorded_position[0], robot_y - last_recorded_position[1]]
-            ) > 1.05:
+            ) >= 1.0386:
                 movement_log.append((robot_x, robot_y, robot_yaw))
-                last_recorded_position = (robot_x, robot_y)  # 更新上次记录的位置
-                # print(f"Recorded position: {robot_x, robot_y, robot_yaw}")
+                last_recorded_position = (robot_x, robot_y)
 
             obstacles = [
                 (ox, oy) for ox, oy in static_obstacles
-                if np.sqrt((ox-robot_x)**2 + (oy - robot_y)**2) < 4.0  # 限制只取机器当前位置半徑6米范围的障碍物 
+                if np.sqrt((ox-robot_x)**2 + (oy - robot_y)**2) < 4.0
             ]
             obstacles = grid_filter(obstacles, grid_size=0.7)
 
             lookahead_index = min(env.current_waypoint_index + 3, len(env.waypoint_distances)-1)
             dwa.goal = env.waypoints[lookahead_index]
 
-            # 根据是否使用 RL 控制，决定动作
             failure_range = range(
                 max(0, env.current_waypoint_index - 6),
                 min(len(env.waypoints), env.current_waypoint_index + 2)
             )
             failure_counts = {i: env.waypoint_failures.get(i, 0) for i in failure_range}
-            print(f"Failure range: {list(failure_range)}, Failure counts: {failure_counts}")
 
             use_deep_rl_control = any(
                 env.waypoint_failures.get(i, 0) > 1 for i in failure_range
             )
 
             if use_deep_rl_control:
-                action = select_action_with_exploration(env, state, model, dwa=dwa, obstacles=obstacles)
-                action_np = action.detach().cpu().numpy().flatten()
-                print(f"RL Action at waypoint {env.current_waypoint_index}: {action_np}")
+                action_np = select_action_with_exploration(env, state ,dwa=dwa,obstacles=obstacles)
+                print(f"DWA Action at waypoint {env.current_waypoint_index}: {action_np}")
             else:
                 action_np = env.calculate_action_pure_pursuit()
                 print(f"A* Action at waypoint {env.current_waypoint_index}: {action_np}")
 
             next_state, reward, done, _ = env.step(action_np, obstacles=obstacles)
 
-            if not isinstance(next_state, torch.Tensor):
-                next_state = torch.tensor(next_state, dtype=torch.float32)
-            next_state = next_state.clone().detach().unsqueeze(0).to(device)
-
-            if use_deep_rl_control:
-                memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-                print(f"[Main] Memory size after adding sample: {sum(1 for x in memory.memory if x is not None)}")
-
             state = next_state
-            total_reward += reward
 
-            state = (state - state.min()) / (state.max() - state.min() + 1e-5)  # 正規化到 [0, 1]
+            state = (state - state.min()) / (state.max() - state.min() + 1e-5)
 
             elapsed_time = time.time() - start_time
             if done or elapsed_time > 240:
@@ -1479,34 +1149,6 @@ def main():
                     reward -= 10.0
                     print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
                 break
-
-        # 仅在使用 RL 控制时更新策略
-        if use_deep_rl_control and len(memory.memory) > BATCH_SIZE:
-            curren_batch_size = min(BATCH_SIZE, len(memory.memory))
-            ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler, batch_size=curren_batch_size)
-
-        print(f"Episode {e}, Total Reward: {total_reward}")
-
-        if total_reward > best_test_reward:
-            best_test_reward = total_reward
-            torch.save(model.state_dict(), best_model_path)
-            print(f"New best model saved with reward: {best_test_reward}")
-
-        if e % 5 == 0:
-            torch.save(model.state_dict(), model_path)
-            print(f"Model saved after {e} episodes.")
-
-        
-        rospy.sleep(1.0)
-
-    visualizer.clear_trajectory()
-    torch.save(model.state_dict(), model_path)
-    print("Final model saved.")
-
-    # 打印记录的移动日志
-    print("Movement Log:")
-    for log in movement_log:
-        print(log)
 
 if __name__ == '__main__':
     main()
